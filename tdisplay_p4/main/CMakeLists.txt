@@ -225,6 +225,12 @@ if(DEFINED ENV{WADA_P4_EXP_BAND_INTERNAL})
   idf_build_set_property(COMPILE_OPTIONS "-DTDP4_EXP_BAND_INTERNAL=1" APPEND)
   message(STATUS "wadamesh: EXPERIMENT draw band in internal RAM")
 endif()
+#   WADA_P4_EXP_DBLFB=1         double-buffered framebuffer, swapped on the DSI frame boundary (AMOLED
+#                               only): removes tearing; see RM69A10Display.cpp
+if(DEFINED ENV{WADA_P4_EXP_DBLFB})
+  idf_build_set_property(COMPILE_OPTIONS "-DTDP4_EXP_DBLFB=1" APPEND)
+  message(STATUS "wadamesh: EXPERIMENT double-buffered framebuffer")
+endif()
 if(DEFINED ENV{WADA_P4_EXP_KB_SLOW})
   idf_build_set_property(COMPILE_OPTIONS "-DTDP4_EXP_KB_SLOW=1" APPEND)
   message(STATUS "wadamesh: EXPERIMENT slow keyboard probe")

@@ -6493,6 +6493,9 @@ static void lvglFlushImpl(lv_disp_drv_t* disp_drv, const lv_area_t* area, lv_col
                           lv_disp_flush_is_last(disp_drv));
 #elif defined(DOC_CAPTURE) && defined(DOC_VIRT_W)
   // A virtual size the panel does not have: only the capture buffer below.
+#elif defined(TDP4_EXP_DBLFB) && defined(HAS_TDISPLAY_P4) && !defined(HAS_TDP4_LCD)
+  display.writePixelsRGB565Ex(area->x1, area->y1, w, h, reinterpret_cast<uint16_t*>(color_p),
+                              lv_disp_flush_is_last(disp_drv));
 #else
   display.writePixelsRGB565(area->x1, area->y1, w, h, reinterpret_cast<uint16_t*>(color_p));
 #endif

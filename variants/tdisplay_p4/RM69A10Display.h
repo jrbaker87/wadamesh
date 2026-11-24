@@ -21,6 +21,9 @@ public:
 
   // LVGL flush hot path — exclusive end coords (see TanmatsuDisplay note).
   void writePixelsRGB565(int x, int y, int w, int h, const uint16_t* pixels);
+  // Same, for LVGL's flush: lastOfFrame = lv_disp_flush_is_last(). Only the double-buffer experiment
+  // (TDP4_EXP_DBLFB) uses it: the frame is presented to the panel on the last band.
+  void writePixelsRGB565Ex(int x, int y, int w, int h, const uint16_t* pixels, bool lastOfFrame);
   void setDisplayRotation(int rot) { (void)rot; }   // TODO(device): panel rotation / SW-rotate
   void startFrame() {}
   // Explicit forward (no default arg) so startFrame() stays unambiguous next to the no-arg one.

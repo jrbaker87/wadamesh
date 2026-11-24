@@ -47,6 +47,103 @@ static bool IRAM_ATTR rm69a10TransDone(esp_lcd_panel_handle_t, esp_lcd_dpi_panel
   return hpw == pdTRUE;
 }
 
+#if defined(TDP4_EXP_DBLFB)
+// ---- Experiment: double-buffered framebuffer (WADA_P4_EXP_DBLFB=1) -------------------------------
+// Default build: one framebuffer that the DSI scans out continuously while every LVGL band is copied
+// INTO it, so a repaint that takes ~50 ms (2-3 panel refreshes) is visible half-drawn = tearing.
+// Here the panel gets two framebuffers. A frame is composed entirely in the BACK buffer (the CPU
+// upscales each LVGL band straight into it), and when LVGL flushes the last band of the refresh the
+// back buffer is handed to the driver: esp_lcd_panel_draw_bitmap() with a pointer INSIDE a
+// framebuffer does a cache write-back and selects that buffer; the DSI ISR then switches to it at
+// the end of the frame being scanned (esp_lcd_panel_dpi.c, dma_trans_done_cb), i.e. on a vsync.
+// The old front becomes the new back, so before it is written it must catch up with the frame it
+// missed: only rows painted last frame differ, and rows this frame repaints in full need no copy.
+namespace {
+uint8_t*          s_fb[2]        = {nullptr, nullptr};
+int               s_front        = 0;       // buffer being scanned (or about to be, once the swap lands)
+bool              s_swap_pending = false;   // a swap was requested; the old front is not free yet
+volatile bool     s_swap_isr_pending = false;
+SemaphoreHandle_t s_swap_sem     = nullptr;
+bool              s_open         = false;   // a frame is being composed in the back buffer
+uint8_t           s_prev_dirty[1232];       // rows where back != front right after the last swap
+uint8_t           s_need[1232];             // rows of the back buffer still to be brought up to date
+uint8_t           s_dirty[1232];            // rows painted in the frame being composed
+int               s_ymin = 0, s_ymax = -1;
+constexpr int     kFbW = 568, kFbH = 1232;
+}  // namespace
+
+static bool IRAM_ATTR rm69a10RefreshDone(esp_lcd_panel_handle_t, esp_lcd_dpi_panel_event_data_t*, void*) {
+  BaseType_t hpw = pdFALSE;
+  if (s_swap_isr_pending) { s_swap_isr_pending = false; xSemaphoreGiveFromISR(s_swap_sem, &hpw); }
+  return hpw == pdTRUE;
+}
+
+// Start composing a frame: wait until the previous swap has landed (the old front is free).
+static void dbOpen() {
+  if (s_open) return;
+  if (s_swap_pending) {
+    s_swap_pending = false;
+    if (xSemaphoreTake(s_swap_sem, pdMS_TO_TICKS(100)) != pdTRUE) s_swap_isr_pending = false;   // carry on
+  }
+  memcpy(s_need, s_prev_dirty, sizeof s_need);
+  memset(s_dirty, 0, sizeof s_dirty);
+  s_ymin = kFbH; s_ymax = -1;
+  s_open = true;
+}
+
+static inline void dbRowCopy(int r) {
+  const size_t o = (size_t)r * kFbW * 2;
+  memcpy(s_fb[1 - s_front] + o, s_fb[s_front] + o, (size_t)kFbW * 2);
+}
+
+// Write one LVGL band into the back buffer, S x S nearest-neighbour (S=1: plain copy).
+static void dbBlit(int x, int y, int w, int h, const uint16_t* src, int S) {
+  dbOpen();
+  int nx = x * S, ny = y * S, nw = w * S, nh = h * S;
+  if (nx < 0 || nx + nw > kFbW || ny < 0) return;
+  if (ny + nh > kFbH) nh = kFbH - ny;
+  const bool fullw = (nx == 0 && nw >= kFbW);
+  uint8_t* back = s_fb[1 - s_front];
+  for (int r = ny; r < ny + nh; ++r) {
+    if (s_need[r]) { if (!fullw) dbRowCopy(r); s_need[r] = 0; }   // a full-width band overwrites the row anyway
+    s_dirty[r] = 1;
+  }
+  if (ny < s_ymin) s_ymin = ny;
+  if (ny + nh - 1 > s_ymax) s_ymax = ny + nh - 1;
+  for (int sr = 0; sr < h && sr * S < nh; ++sr) {
+    const uint16_t* s = src + (size_t)sr * w;
+    uint16_t* d = (uint16_t*)(back + ((size_t)(ny + sr * S) * kFbW + nx) * 2);
+    if (S == 2) {
+      uint32_t* d32 = (uint32_t*)d;                                     // nx even -> 4-byte aligned
+      for (int i = 0; i < w; ++i) { const uint32_t c = s[i]; d32[i] = c | (c << 16); }
+      if (sr * S + 1 < nh) memcpy(d + kFbW, d, (size_t)nw * 2);
+    } else {
+      memcpy(d, s, (size_t)w * 2);
+    }
+  }
+}
+
+// The frame is complete: bring untouched rows up to date, write the buffer back and request the swap.
+static void dbPresent(esp_lcd_panel_handle_t panel) {
+  if (!s_open) return;
+  for (int r = 0; r < kFbH; ++r) {
+    if (!s_need[r]) continue;
+    dbRowCopy(r); s_need[r] = 0;
+    if (r < s_ymin) s_ymin = r;
+    if (r > s_ymax) s_ymax = r;
+  }
+  s_open = false;
+  if (s_ymax < s_ymin) return;                       // nothing was painted
+  xSemaphoreTake(s_swap_sem, 0);                      // drop a stale signal
+  s_swap_isr_pending = false;
+  esp_lcd_panel_draw_bitmap(panel, 0, s_ymin, kFbW, s_ymax + 1, s_fb[1 - s_front]);   // write back + select
+  s_front = 1 - s_front;
+  s_swap_isr_pending = true;                          // armed AFTER the call: at worst one extra refresh of wait
+  s_swap_pending = true;
+  memcpy(s_prev_dirty, s_dirty, sizeof s_dirty);
+}
+#endif  // TDP4_EXP_DBLFB
+
 // RM69A10 DSI timing — LilyGo rm69a10_driver.h (values confirmed via t_display_p4_config.h).
 #define RM_W        568
 #define RM_H        1232
@@ -119,7 +216,11 @@ bool RM69A10Display::begin() {
     .dpi_clk_src = MIPI_DSI_DPI_CLK_SRC_DEFAULT,
     .dpi_clock_freq_mhz = RM_DPI_MHZ,
     .pixel_format = LCD_COLOR_PIXEL_FORMAT_RGB565,
+#if defined(TDP4_EXP_DBLFB)
+    .num_fbs = 2,
+#else
     .num_fbs = 1,
+#endif
     .video_timing = {
       .h_size = RM_W, .v_size = RM_H,
       .hsync_pulse_width = RM_HSYNC, .hsync_back_porch = RM_HBP, .hsync_front_porch = RM_HFP,
@@ -150,8 +251,25 @@ bool RM69A10Display::begin() {
   // buffer directly (memset + a cache flush to make it visible to the DSI's DMA) instead of pushing
   // strips through draw_bitmap: it is one pass with the panel still dark, and it avoids a burst of
   // 39 back-to-back DMA transfers into a buffer the panel is scanning out.
+#if defined(TDP4_EXP_DBLFB)
+  {
+    void *fb0 = nullptr, *fb1 = nullptr;
+    if (esp_lcd_dpi_panel_get_frame_buffer(_panel, 2, &fb0, &fb1) != ESP_OK || !fb0 || !fb1) {
+      Serial.println("[RM69A10] DBLFB: no second framebuffer"); return false;
+    }
+    s_fb[0] = (uint8_t*)fb0; s_fb[1] = (uint8_t*)fb1; s_front = 0;
+    const size_t fb_bytes = (size_t)RM_W * RM_H * 2;
+    memset(fb0, 0, fb_bytes); memset(fb1, 0, fb_bytes);
+    esp_cache_msync(fb0, fb_bytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+    esp_cache_msync(fb1, fb_bytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+    s_swap_sem = xSemaphoreCreateBinary();
+  }
+  void* fb = nullptr;
+  if (false) {
+#else
   void* fb = nullptr;
   if (esp_lcd_dpi_panel_get_frame_buffer(_panel, 1, &fb) == ESP_OK && fb) {
+#endif
     const size_t fb_bytes = (size_t)RM_W * RM_H * 2;
     memset(fb, 0, fb_bytes);
     esp_cache_msync(fb, fb_bytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
@@ -169,7 +287,11 @@ bool RM69A10Display::begin() {
   // (single scratch/draw buffer reuse — see the note at s_flush_sem).
   s_flush_sem = xSemaphoreCreateBinary();
   esp_lcd_dpi_panel_event_callbacks_t cbs = {};
+#if defined(TDP4_EXP_DBLFB)
+  cbs.on_refresh_done = rm69a10RefreshDone;   // swap landed; draw_bitmap's own trans-done is not used
+#else
   cbs.on_color_trans_done = rm69a10TransDone;
+#endif
   esp_lcd_dpi_panel_register_event_callbacks(_panel, &cbs, nullptr);
 
   #if defined(TDP4_POKE_TRACE)
@@ -183,12 +305,44 @@ bool RM69A10Display::begin() {
 // exclusive end coords, and wait for the framebuffer copy before the caller reuses its buffer.
 void RM69A10Display::writeNativeRGB565(int x, int y, int w, int h, const uint16_t* px) {
   if (!_panel || !px || w <= 0 || h <= 0) return;
+#if defined(TDP4_EXP_DBLFB)
+  dbBlit(x, y, w, h, px, 1);
+  dbPresent(_panel);
+  return;
+#endif
   esp_lcd_panel_draw_bitmap(_panel, x, y, x + w, y + h, px);
   if (s_flush_sem) xSemaphoreTake(s_flush_sem, pdMS_TO_TICKS(100));
 }
 
 void RM69A10Display::writePixelsRGB565(int x, int y, int w, int h, const uint16_t* pixels) {
+  writePixelsRGB565Ex(x, y, w, h, pixels, true);   // splash etc.: every call is a whole frame
+}
+
+void RM69A10Display::writePixelsRGB565Ex(int x, int y, int w, int h, const uint16_t* pixels, bool lastOfFrame) {
+  (void)lastOfFrame;
   if (!_panel || !pixels || w <= 0 || h <= 0) return;
+#if defined(TDP4_EXP_DBLFB) && RM_UI_SCALE > 1
+  {
+#if defined(TDP4_PERF_TRACE)
+    const int64_t pf_t0 = p4perf::now();
+#endif
+    dbOpen();
+#if defined(TDP4_PERF_TRACE)
+    const int64_t pf_t1 = p4perf::now();
+#endif
+    dbBlit(x, y, w, h, pixels, RM_UI_SCALE);
+#if defined(TDP4_PERF_TRACE)
+    const int64_t pf_t2 = p4perf::now();
+#endif
+    if (lastOfFrame) dbPresent(_panel);
+#if defined(TDP4_PERF_TRACE)
+    const int64_t pf_t3 = p4perf::now();
+    // up = writing the band into the back buffer; dma-wait = waiting for the last swap + the swap request
+    p4perf::onFlush(pf_t2 - pf_t1, (pf_t1 - pf_t0) + (pf_t3 - pf_t2), false, (uint32_t)(w * h * RM_UI_SCALE * RM_UI_SCALE));
+#endif
+    return;
+  }
+#endif
 #if defined(TDP4_FLUSH_TRACE)
   // Opt-in flush tracer for whole-screen colour-flash reports (#167). OFF unless the build adds
   // -DTDP4_FLUSH_TRACE, so it costs nothing normally. Logs any large, mostly-single-colour band
