@@ -227,9 +227,11 @@ if(DEFINED ENV{WADA_P4_EXP_BAND_INTERNAL})
 endif()
 #   WADA_P4_EXP_DBLFB=1         double-buffered framebuffer, swapped on the DSI frame boundary (AMOLED
 #                               only): removes tearing; see RM69A10Display.cpp
-if(DEFINED ENV{WADA_P4_EXP_DBLFB})
+# Default ON for the AMOLED SKU (tearing-free page changes); `WADA_P4_NO_DBLFB=1` builds the old
+# single-framebuffer path. The TFT-LCD SKU (WADA_P4_LCD) has its own driver and is unaffected.
+if((DEFINED ENV{WADA_P4_EXP_DBLFB} OR NOT DEFINED ENV{WADA_P4_NO_DBLFB}) AND NOT DEFINED ENV{WADA_P4_LCD})
   idf_build_set_property(COMPILE_OPTIONS "-DTDP4_EXP_DBLFB=1" APPEND)
-  message(STATUS "wadamesh: EXPERIMENT double-buffered framebuffer")
+  message(STATUS "wadamesh: double-buffered framebuffer (AMOLED)")
 endif()
 if(DEFINED ENV{WADA_P4_EXP_KB_SLOW})
   idf_build_set_property(COMPILE_OPTIONS "-DTDP4_EXP_KB_SLOW=1" APPEND)
