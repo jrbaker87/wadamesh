@@ -390,6 +390,17 @@ static void urc_scan(const char *buf, size_t n);   // spot +IPD / <id>,CLOSED li
 
 // One AT exchange. Result is tri-state (+busy) so the link-health counter can tell "the C6
 // answered ERROR" (alive) from "nothing came back" (possibly wedged).
+// Never print credentials: the join and soft-AP commands carry the Wi-Fi password in clear text, and
+// serial logs get pasted into bug reports. Keep the command name, drop the arguments.
+static const char *at_log_cmd(const char *cmd, char *out, size_t out_sz) {
+    if (strncmp(cmd, "AT+CWJAP=", 9) == 0 || strncmp(cmd, "AT+CWSAP=", 9) == 0 ||
+        strncmp(cmd, "AT+CWJEAP=", 10) == 0) {
+        snprintf(out, out_sz, "%.*s<redacted>", (int)(strchr(cmd, '=') - cmd + 1), cmd);
+        return out;
+    }
+    return cmd;
+}
+
 static c6h_res_t at_exec(const char *cmd, char *resp, size_t resp_sz, uint32_t timeout_ms,
                          c6h_kind_t kind) {
     if (resp && resp_sz) resp[0] = '\0';
@@ -400,7 +411,8 @@ static c6h_res_t at_exec(const char *cmd, char *resp, size_t resp_sz, uint32_t t
     int len = snprintf((char *)s_tx, C6_TX_CAP, "%s\r\n", cmd);
     if (len <= 0 || len >= C6_TX_CAP) return C6H_RES_ERR;
     if (!transport_send_packet(s_tx, (size_t)len, 1000)) {
-        ESP_LOGW(TAG, "send '%s' failed", cmd);
+        char redacted[40];
+        ESP_LOGW(TAG, "send '%s' failed", at_log_cmd(cmd, redacted, sizeof(redacted)));
         health_note(C6H_RES_TIMEOUT, kind);   // the C6 is not taking data: same as no answer
         return C6H_RES_TIMEOUT;
     }
@@ -440,7 +452,9 @@ static c6h_res_t at_exec(const char *cmd, char *resp, size_t resp_sz, uint32_t t
     urc_scan(buf, n);   // "+IPD"/"<id>,CLOSED" lines interleave with command output — never miss them
     if (resp && resp_sz) { strncpy(resp, buf, resp_sz - 1); resp[resp_sz - 1] = '\0'; }
     static const char *const RES_NAME[] = { "OK", "ERR", "TIMEOUT", "BUSY" };
-    ESP_LOGI(TAG, "AT '%s' -> %s (%u bytes%s)", cmd, RES_NAME[res], (unsigned)n,
+    char redacted[40];
+    const char *shown = at_log_cmd(cmd, redacted, sizeof(redacted));
+    ESP_LOGI(TAG, "AT '%s' -> %s (%u bytes%s)", shown, RES_NAME[res], (unsigned)n,
              truncated ? ", truncated" : "");
     health_note(res, kind);
     return res;
