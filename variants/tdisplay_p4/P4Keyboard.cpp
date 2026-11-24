@@ -35,7 +35,11 @@ namespace {
 
 constexpr uint32_t kHotplugMs      = 1500;   // how often the expansion is looked for
 static bool s_scanned = false;   // one-shot bus scan (see p4KeyboardPoll)
+#if defined(TDP4_EXP_KB_SLOW)
+constexpr uint32_t kHotplugIdleMs  = 60000;  // experiment: each absent-probe costs ~18 ms on the UI task
+#else
 constexpr uint32_t kHotplugIdleMs  = 15000;  // probe rate once the expansion looks absent
+#endif
 constexpr uint8_t  kMissesBeforeBackoff = 4;
 static uint8_t     s_misses = 0;             // consecutive probes that found nothing
 constexpr uint32_t kIdlePollMs     = 120;    // backstop drain when INT says nothing is waiting

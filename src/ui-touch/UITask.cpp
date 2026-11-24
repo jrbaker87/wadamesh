@@ -54922,7 +54922,12 @@ static uint16_t auroraStep(float p) {
 #endif  // CAP_BG_MOVING (auroraStep)
 // After every refresh: a new frame starts over (a fill in the same buffer at the same
 // place is not "the sky drawn a moment ago" any more), and a step's redraw is timed.
-static void auroraMonitorCb(lv_disp_drv_t*, uint32_t ms, uint32_t) {
+static void auroraMonitorCb(lv_disp_drv_t*, uint32_t ms, uint32_t px) {
+#if defined(TDP4_PERF_TRACE)
+  p4perf::onRefr(ms, px);
+#else
+  (void)px;
+#endif
   ++s_aur_seq;
   if (s_aur_timed) { s_aur_refr_ms = ms; s_aur_timed = false; }
 }
@@ -80908,7 +80913,12 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
       g_draw_buf_px = 284 * LV_DRAW_BUF_LINES;
     #endif
       const size_t buf_bytes = sizeof(lv_color_t) * g_draw_buf_px;
-      g_draw_buffer = (lv_color_t*)heap_caps_malloc(buf_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+#if defined(TDP4_EXP_BAND_INTERNAL)
+      // Experiment (WADA_P4_EXP_BAND_INTERNAL=1): ~13 KB band in internal RAM, so LVGL's blends and
+      // glyph writes hit SRAM instead of going through the PSRAM cache. Falls back to PSRAM.
+      g_draw_buffer = (lv_color_t*)heap_caps_malloc(buf_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+#endif
+      if (!g_draw_buffer) g_draw_buffer = (lv_color_t*)heap_caps_malloc(buf_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
       if (!g_draw_buffer) g_draw_buffer = (lv_color_t*)malloc(buf_bytes);
 #else
       // The draw band: what LVGL renders between two flushes. Every band is a whole walk of
@@ -81235,6 +81245,11 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
     // when the base orientation is portrait. In hardware landscape the LVGL
     // rotation is left at NONE so it never software-rotates on top of the panel.
     g_lv.disp_drv.sw_rotate = 1;
+#if defined(TDP4_PERF_TRACE)
+    // Perf build: time LVGL's own refresh. The aurora background chains this from auroraMonitorCb.
+    if (!g_lv.disp_drv.monitor_cb)
+      g_lv.disp_drv.monitor_cb = [](lv_disp_drv_t*, uint32_t ms, uint32_t px) { p4perf::onRefr(ms, px); };
+#endif
   lv_disp_drv_register(&g_lv.disp_drv);
 #if defined(HAS_TANMATSU)
     // Apply the 270° software rotation now that the driver is registered: logical surface
@@ -87528,6 +87543,13 @@ void UITask::loop() {
   {   // T-Display P4 perf build: time the whole LVGL pass and count the bands it flushed
     const uint32_t pf_fl0 = p4perf::g.flushesTotal;
     const int64_t  pf_t0  = p4perf::now();
+    static bool pf_info = false;
+    if (!pf_info && pf_t0 > 8000000) {   // once, after boot: which look is being drawn?
+      pf_info = true;
+      printf("[P4PERF] look: bg_kind=%u (0xFF=plain) glass_tiles=%d glass_on=%d aurora_live=%d draw_buf=%u px in %s, LV_MEMCPY_MEMSET_STD=%d\n",
+             (unsigned)s_bg_kind, (int)s_glass_tiles, (int)s_glass_on, (int)s_bg_live, (unsigned)g_draw_buf_px,
+             esp_ptr_internal(g_draw_buffer) ? "internal RAM" : "PSRAM", (int)LV_MEMCPY_MEMSET_STD);
+    }
     lv_timer_handler();
     p4perf::onLvglPass(p4perf::now() - pf_t0, pf_fl0);
   }

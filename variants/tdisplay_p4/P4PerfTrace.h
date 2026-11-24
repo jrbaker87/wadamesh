@@ -37,6 +37,7 @@
 #include <stdio.h>
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
+#include "esp_memory_utils.h"
 
 namespace p4perf {
 
@@ -51,6 +52,8 @@ struct Acc {
 
 struct State {
   Acc up, dma, pass, loopUi, loopRest;     // microseconds
+  Acc refr;                                // LVGL's own refresh (render+flush), ms*1000
+  uint32_t passRefrMs = 0;                 // refresh time reported inside the current pass
   uint32_t flushesTotal = 0;               // monotonic, used to count bands inside one pass
   uint32_t flushesWin = 0;                 // this one-second window
   uint32_t flushPxWin = 0;
@@ -75,16 +78,28 @@ inline void onFlush(int64_t up_us, int64_t dma_us, bool timedOut, uint32_t px) {
   if (timedOut) ++g.dmaTimeoutsWin;
 }
 
+// LVGL finished one display refresh (disp_drv.monitor_cb): ms = time of the whole refresh
+// (render + flush of every band). Pass time minus this is spent in OTHER lv_timers
+// (animations, app timers) and anything those call.
+inline void onRefr(uint32_t ms, uint32_t /*px*/) {
+  g.refr.add((uint64_t)ms * 1000u);
+  g.passRefrMs += ms;
+}
+
 // One lv_timer_handler() call finished. flushesBefore = g.flushesTotal sampled before the call.
 inline void onLvglPass(int64_t us, uint32_t flushesBefore) {
   const uint32_t bands = g.flushesTotal - flushesBefore;
+  const uint32_t refrMs = g.passRefrMs;
+  g.passRefrMs = 0;
   if (bands == 0) return;                  // idle call: nothing was drawn, not a frame
   g.pass.add((uint64_t)us);
   ++g.passesWin;
   g.bandsInPassesWin += bands;
   if (us > 40000 && (now() - g.lastSlowUs) > 100000) {
     g.lastSlowUs = now();
-    printf("[P4PERF] slow pass %.1f ms (%u bands)\n", (double)us / 1000.0, (unsigned)bands);
+    const double other = (double)us / 1000.0 - (double)refrMs;
+    printf("[P4PERF] slow pass %.1f ms (%u bands) = lvgl refresh %u ms + other timers/callbacks %.0f ms\n",
+           (double)us / 1000.0, (unsigned)bands, (unsigned)refrMs, other);
   }
 }
 
@@ -106,11 +121,11 @@ inline void tick() {
   if (active) {
     const double secs = (double)dt / 1e6;
     const double bandsPerPass = g.passesWin ? (double)g.bandsInPassesWin / (double)g.passesWin : 0.0;
-    printf("[P4PERF] pass/s=%.1f bands/pass=%.1f | pass %.1f/%.1f ms | upscale %.2f/%.2f ms | "
+    printf("[P4PERF] pass/s=%.1f bands/pass=%.1f | pass %.1f/%.1f ms (refr avg %.1f max %.0f) | upscale %.2f/%.2f ms | "
            "dma-wait %.2f/%.2f ms to=%u | loop ui %.1f/%.1f ms rest %.1f/%.1f ms | "
            "heap int=%uK big=%uK psram=%uK\n",
            (double)g.passesWin / secs, bandsPerPass,
-           g.pass.avgMs(), g.pass.maxMs(),
+           g.pass.avgMs(), g.pass.maxMs(), g.refr.avgMs(), g.refr.maxMs(),
            g.up.avgMs(), g.up.maxMs(),
            g.dma.avgMs(), g.dma.maxMs(), (unsigned)g.dmaTimeoutsWin,
            g.loopUi.avgMs(), g.loopUi.maxMs(),
@@ -119,7 +134,7 @@ inline void tick() {
            (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024),
            (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
   }
-  g.up.reset(); g.dma.reset(); g.pass.reset(); g.loopUi.reset(); g.loopRest.reset();
+  g.up.reset(); g.dma.reset(); g.pass.reset(); g.refr.reset(); g.loopUi.reset(); g.loopRest.reset();
   g.flushesWin = 0; g.flushPxWin = 0; g.dmaTimeoutsWin = 0; g.passesWin = 0; g.bandsInPassesWin = 0;
 }
 

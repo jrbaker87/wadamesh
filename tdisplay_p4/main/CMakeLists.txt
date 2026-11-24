@@ -212,6 +212,24 @@ if(DEFINED ENV{WADA_P4_PERF_TRACE})
   message(STATUS "wadamesh: PERF TRACE enabled (measurement build, do not ship)")
 endif()
 
+# Performance experiments (each independent, each off by default; see the perf/p4-exp1 notes):
+#   WADA_P4_EXP_MEMCPY=1        -DLV_MEMCPY_MEMSET_STD=1 (LVGL uses libc memcpy/memset; the P4 build was
+#                               on LVGL's byte-loop fallback)
+#   WADA_P4_EXP_BAND_INTERNAL=1 LVGL draw band (13 KB) in internal RAM instead of PSRAM
+#   WADA_P4_EXP_KB_SLOW=1       keyboard-expansion probe every 60 s instead of 15 s once absent
+if(DEFINED ENV{WADA_P4_EXP_MEMCPY})
+  idf_build_set_property(COMPILE_OPTIONS "-DLV_MEMCPY_MEMSET_STD=1" APPEND)
+  message(STATUS "wadamesh: EXPERIMENT LV_MEMCPY_MEMSET_STD=1")
+endif()
+if(DEFINED ENV{WADA_P4_EXP_BAND_INTERNAL})
+  idf_build_set_property(COMPILE_OPTIONS "-DTDP4_EXP_BAND_INTERNAL=1" APPEND)
+  message(STATUS "wadamesh: EXPERIMENT draw band in internal RAM")
+endif()
+if(DEFINED ENV{WADA_P4_EXP_KB_SLOW})
+  idf_build_set_property(COMPILE_OPTIONS "-DTDP4_EXP_KB_SLOW=1" APPEND)
+  message(STATUS "wadamesh: EXPERIMENT slow keyboard probe")
+endif()
+
 if(DEFINED ENV{C6_FLASH_HELPER})
   idf_build_set_property(COMPILE_OPTIONS "-DTDP4_C6_FLASH_HELPER=1" APPEND)
   message(STATUS "wadamesh: BUILDING C6-FLASH HELPER (P4 leaves the C6 free)")
