@@ -37186,7 +37186,15 @@ static void mapSdWriteFailed() {
 #if CAP_SD
   sdNoteIoFailure();
 #else
-  s_map_sd_storage_changed = true;
+  // Each flag makes the UI loop probe the card (open "/") and re-render the map. On a card that is
+  // stuck programming that probe can block the UI task, and a failing writer raised the flag on every
+  // tile. Once per 15 s is plenty to notice a dead card.
+  static uint32_t s_last_flag_ms = 0;
+  const uint32_t now_ms = millis();
+  if (s_last_flag_ms == 0 || now_ms - s_last_flag_ms > 15000) {
+    s_last_flag_ms = now_ms ? now_ms : 1;
+    s_map_sd_storage_changed = true;
+  }
 #endif
 }
 #endif
@@ -37433,9 +37441,37 @@ static volatile int16_t  s_tile_fetch_last_code = 0;
 //   'Z' bad/oversized content-length   'e' HTTP != 200
 //   'J' body was not a JPEG (proxy error page / blank body)
 //   'S' cache low-space gate   'H' internal-heap gate   'W' Wi-Fi down
+//   'D' downloads paused by the SD write circuit breaker
 static volatile char     s_tile_fetch_last_wr   = '-';
 static volatile uint16_t s_tile_fetch_open_fail = 0;   // tileCacheOpen("w") returned an invalid File
 static volatile uint16_t s_tile_fetch_short_wr  = 0;   // f.write() committed fewer bytes than received
+#if CAP_MICROSD
+// SD write circuit breaker. A card that stays busy after a write (status "programming", every later
+// command rejected) used to be retried tile after tile: each attempt held the fetch worker for the
+// 12 s tile deadline, hit the card again, flagged the UI loop to probe it, and re-downloaded the same
+// tile over Wi-Fi a few seconds later. After 3 consecutive failed tile writes, pause downloading for
+// 30 s, doubling (up to 10 min) while it keeps failing. Cached tiles still read normally. The first
+// successful write resets it. last_wr shows 'D' on the map tab while paused.
+static volatile uint8_t  s_tile_sd_wr_fail_run = 0;
+static volatile uint32_t s_tile_sd_pause_until = 0;     // millis(); 0 = not paused
+static uint32_t          s_tile_sd_pause_ms    = 0;     // current pause length (0 = no failures yet)
+static bool tileSdPaused() {
+  const uint32_t until = s_tile_sd_pause_until;
+  if (until == 0) return false;
+  if ((int32_t)(millis() - until) < 0) return true;
+  s_tile_sd_pause_until = 0;                              // expired: try one more write
+  return false;
+}
+static void tileSdWriteResult(bool ok) {
+  if (ok) { s_tile_sd_wr_fail_run = 0; s_tile_sd_pause_ms = 0; s_tile_sd_pause_until = 0; return; }
+  if (++s_tile_sd_wr_fail_run < 3) return;
+  s_tile_sd_wr_fail_run = 0;
+  s_tile_sd_pause_ms = s_tile_sd_pause_ms ? (s_tile_sd_pause_ms * 2 > 600000u ? 600000u : s_tile_sd_pause_ms * 2) : 30000u;
+  const uint32_t until = millis() + s_tile_sd_pause_ms;
+  s_tile_sd_pause_until = until ? until : 1;
+  printf("[TILE] SD tile writes keep failing: pausing tile downloads for %lu s\n", (unsigned long)(s_tile_sd_pause_ms / 1000));
+}
+#endif
 // Recently-queued dedup ring — prevents the same (z,x,y) being enqueued
 // dozens of times on rapid pan. Sized to cover one full pass: the 9 visible
 // tiles + the ~20-tile zoomed-out prefetch pyramid + a little history.
@@ -39440,6 +39476,17 @@ static void tileFetchTaskFn(void* arg) {
     if (s_tile_fs == &s_tiles_fs)
       tileCacheRemove(path_png);   // no-op if absent (don't gate on the broken exists())
 
+#if CAP_MICROSD
+    // SD write breaker open: skip the download (no Wi-Fi, no card write). Forget the tile so the
+    // render re-queues it once writes work again.
+    if (s_tile_fs == mapSdStorage() && tileSdPaused()) {
+      s_tile_fetch_last_wr = 'D';
+      ++s_tile_fetch_failed;
+      tileFetchForget(req.z, req.x, req.y);
+      tileFetchPendingDec();
+      continue;
+    }
+#endif
     // Heap-safety gate: opening a TCP socket costs ~6 KB of internal DMA
     // RAM, and the Wi-Fi driver needs more on top for RX. If internal
     // heap is critically low (render thread mid-decode, etc.) wait it
@@ -39590,7 +39637,7 @@ static void tileFetchTaskFn(void* arg) {
               ++s_tile_fetch_short_wr;
               s_tile_fetch_last_wr = 'P';            // short/failed disk write (card full or SD error)
 #if CAP_MICROSD
-              if (s_tile_fs == mapSdStorage()) mapSdWriteFailed();   // wedge tell (worker task — stamp only)
+              if (s_tile_fs == mapSdStorage()) { mapSdWriteFailed(); tileSdWriteResult(false); }   // wedge tell (worker task — stamp only)
 #endif
             }
           }
@@ -39598,7 +39645,7 @@ static void tileFetchTaskFn(void* arg) {
           ++s_tile_fetch_open_fail;
           s_tile_fetch_last_wr = 'O';                // open("w") failed: dir missing / write-protect / SD bus
 #if CAP_MICROSD
-          if (s_tile_fs == mapSdStorage()) mapSdWriteFailed();       // wedge tell (worker task — stamp only)
+          if (s_tile_fs == mapSdStorage()) { mapSdWriteFailed(); tileSdWriteResult(false); }   // wedge tell (worker task — stamp only)
 #endif
         }
       } else {
@@ -39618,6 +39665,9 @@ static void tileFetchTaskFn(void* arg) {
     backend_lease.release();
 
     if (wrote) {
+#if CAP_MICROSD
+      if (s_tile_fs == mapSdStorage()) tileSdWriteResult(true);
+#endif
       WIRE_DBG("[TILE]  -> wrote %s\n", path_jpg);
       s_tile_fetch_step = 'w';
       s_tile_fetch_last_wr = 'w';
