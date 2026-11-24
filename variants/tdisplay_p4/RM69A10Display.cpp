@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #if defined(HAS_TDISPLAY_P4)
 #include "RM69A10Display.h"
+#include "P4PerfTrace.h"   // opt-in frame/flush profiler (TDP4_PERF_TRACE); empty otherwise
 #include <Arduino.h>
 #include "esp_heap_caps.h"
 #include "esp_cache.h"   // esp_cache_msync — flush the memset framebuffer out to the DSI DMA
@@ -245,21 +246,40 @@ void RM69A10Display::writePixelsRGB565(int x, int y, int w, int h, const uint16_
     s_up_px = s_up ? need : 0;
   }
   if (s_up) {
+#if defined(TDP4_PERF_TRACE)
+    const int64_t pf_t0 = p4perf::now();
+#endif
     for (int row = 0; row < h; row++) {
       const uint16_t* src = pixels + (size_t)row * w;
       uint16_t* d0 = s_up + (size_t)(row * S) * dw;                 // first of S output rows
       for (int i = 0; i < w; i++) { uint16_t c = src[i]; uint16_t* p = d0 + i * S; for (int sx = 0; sx < S; sx++) p[sx] = c; }
       for (int sy = 1; sy < S; sy++) memcpy(d0 + (size_t)sy * dw, d0, (size_t)dw * sizeof(uint16_t));
     }
+#if defined(TDP4_PERF_TRACE)
+    const int64_t pf_t1 = p4perf::now();
+#endif
     esp_lcd_panel_draw_bitmap(_panel, x * S, y * S, x * S + dw, y * S + dh, s_up);
+#if defined(TDP4_PERF_TRACE)
+    const bool pf_ok = !s_flush_sem || xSemaphoreTake(s_flush_sem, pdMS_TO_TICKS(100)) == pdTRUE;
+    p4perf::onFlush(pf_t1 - pf_t0, p4perf::now() - pf_t1, !pf_ok, (uint32_t)(dw * dh));
+#else
     if (s_flush_sem) xSemaphoreTake(s_flush_sem, pdMS_TO_TICKS(100));   // wait for the FB copy before the next flush reuses s_up
+#endif
     return;
   }
   // fall through to an unscaled draw if the scratch alloc failed (tiny UI, but visible)
 #endif
   // exclusive end coords (esp_lcd_panel_draw_bitmap contract).
+#if defined(TDP4_PERF_TRACE)
+  const int64_t pf_u0 = p4perf::now();
+#endif
   esp_lcd_panel_draw_bitmap(_panel, x, y, x + w, y + h, pixels);
+#if defined(TDP4_PERF_TRACE)
+  const bool pf_uok = !s_flush_sem || xSemaphoreTake(s_flush_sem, pdMS_TO_TICKS(100)) == pdTRUE;
+  p4perf::onFlush(0, p4perf::now() - pf_u0, !pf_uok, (uint32_t)(w * h));
+#else
   if (s_flush_sem) xSemaphoreTake(s_flush_sem, pdMS_TO_TICKS(100));   // wait for the FB copy before LVGL reuses this buffer
+#endif
 }
 
 void RM69A10Display::setBrightness(uint8_t b) {

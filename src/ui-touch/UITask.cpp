@@ -279,6 +279,7 @@ static_assert(ChannelSenderSplit::kMaxWireName >= (size_t)UITask::MAX_SENDER_NAM
     #else
       #include <RM69A10Display.h>            // RM69A10 MIPI-DSI AMOLED (default SKU) on the T-Display P4
     #endif
+    #include <P4PerfTrace.h>                 // opt-in frame/flush profiler (TDP4_PERF_TRACE); empty otherwise
   #elif defined(HAS_CROWPANEL_P4_101)
     #include <EK79007Display.h>              // EK79007 MIPI-DSI IPS, 1024x600, on the CrowPanel P4 10.1
   #else
@@ -87523,6 +87524,13 @@ void UITask::loop() {
   // When LVGL has nothing due for a couple of ms, yield 1 ms back to FreeRTOS
   // instead of spinning Core 1 at 100%.
   if (lv_next_ms >= 2) vTaskDelay(1);
+#elif defined(TDP4_PERF_TRACE)
+  {   // T-Display P4 perf build: time the whole LVGL pass and count the bands it flushed
+    const uint32_t pf_fl0 = p4perf::g.flushesTotal;
+    const int64_t  pf_t0  = p4perf::now();
+    lv_timer_handler();
+    p4perf::onLvglPass(p4perf::now() - pf_t0, pf_fl0);
+  }
 #else
   lv_timer_handler();
 #endif

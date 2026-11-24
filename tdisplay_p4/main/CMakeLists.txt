@@ -204,6 +204,14 @@ if(DEFINED ENV{WADA_P4_FLUSH_TRACE})
   message(STATUS "wadamesh: FLUSH TRACE enabled (diagnostic build, do not ship)")
 endif()
 
+# Performance baseline (see variants/tdisplay_p4/P4PerfTrace.h): `WADA_P4_PERF_TRACE=1 ./build.sh build`
+# prints one [P4PERF] line a second (fps, bands per pass, render/upscale/DMA-wait time, UI-vs-rest loop
+# time, free heap) plus a line for any single LVGL pass over 40 ms. Zero cost when unset.
+if(DEFINED ENV{WADA_P4_PERF_TRACE})
+  idf_build_set_property(COMPILE_OPTIONS "-DTDP4_PERF_TRACE=1" APPEND)
+  message(STATUS "wadamesh: PERF TRACE enabled (measurement build, do not ship)")
+endif()
+
 if(DEFINED ENV{C6_FLASH_HELPER})
   idf_build_set_property(COMPILE_OPTIONS "-DTDP4_C6_FLASH_HELPER=1" APPEND)
   message(STATUS "wadamesh: BUILDING C6-FLASH HELPER (P4 leaves the C6 free)")

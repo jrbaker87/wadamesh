@@ -34,6 +34,7 @@
 // Defined in this tree's src/helpers/esp32/WifiRuntimeStore.cpp. The <helpers/esp32/WifiRuntimeStore.h>
 // above resolves to the core's vendored copy, which predates it, so declare it here.
 bool wifiScanIsActive();
+#include "P4PerfTrace.h"           // opt-in frame/flush profiler (TDP4_PERF_TRACE); empty otherwise
 #include "esp_hosted.h"
 #include "esp_netif.h"
 #include "esp_event.h"
@@ -570,7 +571,13 @@ extern "C" void app_main(void) {
   bool wifi_screen_was_off = false;
 
   for (;;) {
+#if defined(TDP4_PERF_TRACE)
+    const int64_t pf_loop0 = p4perf::now();
+#endif
     ui_task.loop();
+#if defined(TDP4_PERF_TRACE)
+    const int64_t pf_loop1 = p4perf::now();
+#endif
     if (wifi_crash_guard::tick()) ui_task.showAlert(TR("Wi-Fi was switched off because the device crashed while it was on. Turn it on in Settings > Wi-Fi to try again."), 9000);
     {   // the screen coming back on asks for one prompt rejoin if the link is down (#685)
       const bool off = ui_task.isScreenOff();
@@ -708,6 +715,10 @@ extern "C" void app_main(void) {
     sensors.loop();
 
     the_mesh.loop();
+#if defined(TDP4_PERF_TRACE)
+    p4perf::onLoop(pf_loop1 - pf_loop0, p4perf::now() - pf_loop1);   // UI vs everything else in this loop
+    p4perf::tick();                                                   // one [P4PERF] line per second
+#endif
     vTaskDelay(1);
   }
 }
