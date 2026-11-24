@@ -138,6 +138,23 @@ inline void tick() {
   g.flushesWin = 0; g.flushPxWin = 0; g.dmaTimeoutsWin = 0; g.passesWin = 0; g.bandsInPassesWin = 0;
 }
 
+// RAII timer for code the UI runs on one page change. Prints "[P4PERF]   build <name> N ms" when the
+// scope took longer than thr_us (default 4 ms), so a log names the slow steps of a transition.
+struct Scope {
+  const char* n; int64_t t0; int64_t thr;
+  explicit Scope(const char* name, int64_t thr_us = 4000) : n(name), t0(now()), thr(thr_us) {}
+  ~Scope() {
+    const int64_t d = now() - t0;
+    if (d > thr) printf("[P4PERF]   build %s %.1f ms\n", n, (double)d / 1000.0);
+  }
+};
+
 }  // namespace p4perf
 
+#define P4PERF_CAT2(a, b) a##b
+#define P4PERF_CAT(a, b) P4PERF_CAT2(a, b)
+#define P4PERF_SCOPE(name) p4perf::Scope P4PERF_CAT(p4perf_scope_, __LINE__)(name)
+
+#else
+#define P4PERF_SCOPE(name) ((void)0)
 #endif  // TDP4_PERF_TRACE

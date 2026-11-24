@@ -285,6 +285,9 @@ static_assert(ChannelSenderSplit::kMaxWireName >= (size_t)UITask::MAX_SENDER_NAM
   #else
     #include <helpers/ui/ST7789LCDDisplay.h>
   #endif
+#ifndef P4PERF_SCOPE
+#define P4PERF_SCOPE(name) ((void)0)   // perf-trace scopes: nothing outside the T-Display P4 trace build
+#endif
   #include <helpers/AdvertDataHelpers.h>
   #include <helpers/sensors/LPPDataHelpers.h>
   #include <helpers/TouchDiagTrace.h>
@@ -14262,18 +14265,56 @@ static void updateTabIndicator() {
     lv_obj_align(s_tab_indicator, LV_ALIGN_BOTTOM_LEFT, cx - TAB_INDICATOR_W / 2, -2);
 }
 
+#if defined(TDP4_PERF_TRACE)
+// Perf build: time every lv_timer callback. A pass that is slow in "other timers/callbacks" now says
+// WHICH callback, as a code address; decode it with
+//   riscv32-esp-elf-addr2line -pfiaC -e build/tdisplay_p4/application.elf <addr>
+// (idf_monitor does this for you). The indev read timer runs every touch/click handler, so a page
+// build triggered by a tap shows up under that timer; the named [P4PERF] build lines say which step.
+namespace {
+struct PfTimer { lv_timer_t* t; lv_timer_cb_t orig; };
+PfTimer s_pf_timers[96];
+int     s_pf_timer_n = 0;
+int64_t s_pf_last_log = 0;
+void pfTimerShim(lv_timer_t* t) {
+  lv_timer_cb_t orig = nullptr;
+  for (int i = 0; i < s_pf_timer_n; ++i) if (s_pf_timers[i].t == t) { orig = s_pf_timers[i].orig; break; }
+  if (!orig) return;
+  const int64_t t0 = p4perf::now();
+  orig(t);
+  const int64_t d = p4perf::now() - t0;
+  if (d > 8000 && (t0 - s_pf_last_log) > 20000) {
+    s_pf_last_log = t0;
+    printf("[P4PERF]   lv_timer cb %p took %.1f ms\n", (void*)orig, (double)d / 1000.0);
+  }
+}
+void pfWrapTimers() {
+  for (lv_timer_t* t = lv_timer_get_next(nullptr); t; t = lv_timer_get_next(t)) {
+    if (t->timer_cb == pfTimerShim) continue;
+    int slot = -1;
+    for (int i = 0; i < s_pf_timer_n; ++i) if (s_pf_timers[i].t == t) { slot = i; break; }   // address reused
+    if (slot < 0 && s_pf_timer_n < 96) slot = s_pf_timer_n++;
+    if (slot < 0) continue;
+    s_pf_timers[slot].t = t; s_pf_timers[slot].orig = t->timer_cb;
+    t->timer_cb = pfTimerShim;
+  }
+}
+}  // namespace
+#endif
+
 static void tabChangedCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  P4PERF_SCOPE("tabChangedCb (whole)");
 #if defined(TLORA_PAGER)
   navTabMemLeaving();   // first: closeSettingsModal below empties the focus group
 #endif
   scheduleHeavyRefresh(170);
-  closeSettingsModal();
-  closeSettingsCategory();   // a category detail sheet floats on layer_top — drop it on tab change
-  closeMentionsScreen();     // transient overlay — switching tabs leaves it
+  { P4PERF_SCOPE("closeSettingsModal"); closeSettingsModal(); }
+  { P4PERF_SCOPE("closeSettingsCategory"); closeSettingsCategory(); }  // a category detail sheet floats on layer_top — drop it on tab change
+  { P4PERF_SCOPE("closeMentionsScreen"); closeMentionsScreen(); }  // transient overlay — switching tabs leaves it
 
   const int new_t         = getActiveTab();
-  updateTabIndicator();   // slide the accent glow bar under the newly-active tab
+  { P4PERF_SCOPE("updateTabIndicator"); updateTabIndicator(); }  // slide the accent glow bar under the newly-active tab
 #if CAP_KEYPAD_NAV
   if (new_t == CHAT_INBOX_TAB_INDEX && s_lv_tab_prev != CHAT_INBOX_TAB_INDEX) {
     s_nav_focus_first_thread = true;
@@ -14322,14 +14363,14 @@ static void tabChangedCb(lv_event_t* e) {
     // only the second one reached the widgets.
     if (s_home_drawer_mode || s_home_is_drawer) { s_home_drawer_mode = true; openAppDrawer(); }
   } else if (new_t != HOME_TAB_INDEX && prev_t == HOME_TAB_INDEX) {
-    closeAppDrawerSync();                        // leaving Home -> hide (mode kept); sync so the map can't paint under it
+  { P4PERF_SCOPE("closeAppDrawerSync"); closeAppDrawerSync(); }  // leaving Home -> hide (mode kept); sync so the map can't paint under it
     if (s_hw_arrange) hwArrangeDone();           // ...and Arrange is done (saved)
   }
   // The list is prebuilt at boot. Let the 150 ms tab slide paint those cached rows
   // before running a potentially 1.3 s freshness rebuild (#433).
   if (new_t == CONTACTS_TAB_INDEX) g_lv.dirty_contacts = true;
   else if (prev_t == CONTACTS_TAB_INDEX) ctExitSelectMode();   // a mode must not outlive the tab it belongs to
-  if (new_t == SETTINGS_TAB_INDEX) settingsLandingRefresh();     // the network, the charge... as they are now
+  { P4PERF_SCOPE("settingsLandingRefresh"); if (new_t == SETTINGS_TAB_INDEX) settingsLandingRefresh(); }  // the network, the charge... as they are now
 #if defined(HAS_EXPANSION_KIT)
   if (new_t == SENSORS_TAB_INDEX) refreshSensorsTab();
 #endif
@@ -14338,7 +14379,7 @@ static void tabChangedCb(lv_event_t* e) {
     s_map_loading = true;
 #endif
     applyMapChrome(true);    // transparent status bar + tab bar so the map shows through
-    onMapTabActivated();
+  { P4PERF_SCOPE("onMapTabActivated"); onMapTabActivated(); }
   } else {
     if (prev_t == MAP_TAB_INDEX) applyMapChrome(false);   // restore opaque chrome
     clearRouteReplay();    // drop any route-replay overlay when leaving the map
@@ -14377,7 +14418,7 @@ static void tabChangedCb(lv_event_t* e) {
     }
     if (g_statusbar.root) lv_obj_clear_flag(g_statusbar.root, LV_OBJ_FLAG_HIDDEN);
   }
-  if (g_lv.task) g_lv.task->onLvTabChanged(new_t);
+  { P4PERF_SCOPE("onLvTabChanged"); if (g_lv.task) g_lv.task->onLvTabChanged(new_t); }
 }
 
 // How a tab switch moves. The map's first paint blocks for ~2.5 s, so it never
@@ -46160,6 +46201,7 @@ static void settingsSheetCloseCb(lv_event_t* e) {
   if (lv_event_get_code(e) == LV_EVENT_CLICKED) closeSettingsCategory();
 }
 static void openSettingsCategory(int cat) {
+  P4PERF_SCOPE("openSettingsCategory");
   if (cat < 0 || cat >= CAT_COUNT) return;
   if (settingsModalIsOpen()) closeSettingsModal();
   closeSettingsCategory();   // close any prior sheet first
@@ -87594,6 +87636,7 @@ void UITask::loop() {
   if (lv_next_ms >= 2) vTaskDelay(1);
 #elif defined(TDP4_PERF_TRACE)
   {   // T-Display P4 perf build: time the whole LVGL pass and count the bands it flushed
+    pfWrapTimers();
     const uint32_t pf_fl0 = p4perf::g.flushesTotal;
     const int64_t  pf_t0  = p4perf::now();
     static bool pf_info = false;
