@@ -556,10 +556,18 @@ bool c6at_begin(void) {
         ESP_LOGI(TAG,
                  "ESP-AT startup: ready=%s bytes=%u token=%s%lu rxlen=%s%lu irq=%s0x%08lx",
                  strstr(ready, "ready") ? "yes" : "no", (unsigned)ready_n,
-                 token_ok ? "" : "ERR/", (unsigned long)token,
-                 length_ok ? "" : "ERR/", (unsigned long)(rx_total & C6_AT_RX_LENGTH_MASK),
-                 irq_ok ? "" : "ERR/", (unsigned long)irq);
+                 token_ok ? "" : "ERR/", token_ok ? (unsigned long)token : 0ul,   // a failed read leaves buffer garbage (0xCCCCCCCC)
+                 length_ok ? "" : "ERR/", length_ok ? (unsigned long)(rx_total & C6_AT_RX_LENGTH_MASK) : 0ul,
+                 irq_ok ? "" : "ERR/", irq_ok ? (unsigned long)irq : 0ul);
         s_ready_checked = true;
+        if (!token_ok && !length_ok && !irq_ok) {
+            // Every SDIO register read timed out: the slave side is not answering at all, so the 4-10 s of
+            // AT probes below cannot succeed. Boot logs show this on EVERY cold start, and the rebuild
+            // (bring SDIO down, reset the C6, bring it up) is what fixes it. Return now and let
+            // link_bringup() do that straight away instead of after ~10 s of failed probes.
+            ESP_LOGW(TAG, "SDIO registers unreadable -- rebuilding the link now");
+            return false;
+        }
     }
 
     for (int i = 0; i < 10; i++) {                 // the C6 may still be booting ESP-AT
@@ -694,7 +702,21 @@ static void worker_sock_connect(c6_req_t *rq) {
              rq->id, rq->ssl ? "SSL" : "TCP", rq->host, (unsigned)rq->port);
     // SOFT: a connect can time out because the far host is dead, not the C6. It only asks for a
     // liveness ping and never counts toward the stall streak (tile fetches hit dead hosts).
-    bool ok = at_exec(cmd, NULL, 0, 15000, C6H_KIND_SOFT) == C6H_RES_OK;
+    static char cresp[96];
+    cresp[0] = 0;
+    const int64_t t0 = esp_timer_get_time();
+    bool ok = at_exec(cmd, cresp, sizeof(cresp), 15000, C6H_KIND_SOFT) == C6H_RES_OK;
+    if (!ok && (esp_timer_get_time() - t0) < 3000000) {
+        // Failed fast = the C6 answered ERROR (not a dead host timing out). Field logs show tile
+        // fetches then cycling "CIPSTART -> ERR" every ~0.5 s for a minute after one failed send. A
+        // link id the C6 still thinks is in use is one cause, so close it (harmless if it is not) and
+        // try once more, and keep the C6's own words for the next bug report.
+        ESP_LOGW(TAG, "sock%d connect refused: '%.60s' -- closing the id and retrying once", rq->id, cresp);
+        char cc[24];
+        snprintf(cc, sizeof(cc), "AT+CIPCLOSE=%d", rq->id);
+        c6at_command(cc, NULL, 0, 1000);
+        ok = at_exec(cmd, cresp, sizeof(cresp), 15000, C6H_KIND_SOFT) == C6H_RES_OK;
+    }
     s->open = ok;
     if (rq->status) *rq->status = ok ? REQ_OK : REQ_FAIL;
 }
@@ -730,7 +752,15 @@ static void worker_sock_send(c6_req_t *rq) {
     // Success at debug only — the web-mirror stream sends many frames/s and a per-send
     // INFO line would both flood the console and throttle the stream.
     if (ok) ESP_LOGD(TAG, "sock%d send %u -> OK", rq->id, (unsigned)rq->len);
-    else    ESP_LOGI(TAG, "sock%d send %u -> FAIL", rq->id, (unsigned)rq->len);
+    else {
+        ESP_LOGI(TAG, "sock%d send %u -> FAIL (last C6 reply: '%.60s')", rq->id, (unsigned)rq->len, acc);
+        // The id is in an unknown state (no prompt, or no SEND OK). Close it best-effort so the next
+        // CIPSTART on this id starts clean; the owner's later close then sees open=false and skips.
+        char cc[24];
+        snprintf(cc, sizeof(cc), "AT+CIPCLOSE=%d", rq->id);
+        c6at_command(cc, NULL, 0, 1000);
+        s->open = false;
+    }
     if (rq->status) *rq->status = ok ? REQ_OK : REQ_FAIL;
 }
 
@@ -909,10 +939,10 @@ static void worker_do_join(const char *ssid, const char *pass) {
 // Shared by the boot path (10 attempts) and the runtime recovery path (3 attempts).
 static bool link_bringup(int attempts) {
     for (int i = 0; i < attempts; i++) {
-        if (c6at_begin()) return true;
+        if (c6at_begin()) { ESP_LOGI(TAG, "worker: AT link up on attempt %d", i + 1); return true; }
         // Reuse a successfully initialized slot while the C6 is merely
         // booting, but periodically rebuild a poisoned/half-open SDIO link.
-        if (i % 3 == 2 && i + 1 < attempts) {
+        if ((i % 3 == 2 || (i == 0 && attempts >= 10)) && i + 1 < attempts) {
             ESP_LOGW(TAG, "worker: rebuilding C6 SDIO link after failed AT probes");
             sdio_bring_down();
             if (!tdisplay_p4_reset_c6()) ESP_LOGE(TAG, "worker: C6 reset hook failed");
