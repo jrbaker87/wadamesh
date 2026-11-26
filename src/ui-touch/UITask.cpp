@@ -35972,7 +35972,7 @@ static lv_obj_t* appDrawerRoot() { return s_appdrawer_root; }   // for navOnMain
 // Badge counts baked into the drawer grid when it was last built, so the
 // refresh tick can tell whether they still match reality (see #393).
 static uint32_t  s_appdrawer_badge_sig = 0;
-// Leaving Home parks the drawer (hidden, kept) instead of deleting it, so coming back does not
+// Leaving Home parks the drawer (hidden, on an unloaded screen) instead of deleting it, so coming back does not
 // rebuild the whole grid (~33 ms on the P4, incl. an SD scan of installed Lua apps). Kept apart
 // from s_appdrawer_root, which everywhere means "the drawer is up". Reused only while the
 // settings that shape the grid are unchanged (appDrawerBuildKey); the badge tick in
@@ -62251,6 +62251,13 @@ static void closeAppDrawerSync() {
     s_appdrawer_parked     = s_appdrawer_root;
     s_appdrawer_parked_key = appDrawerBuildKey();
     s_appdrawer_root       = nullptr;
+    // Off lv_layer_top() onto a screen that is never loaded: a HIDDEN child of the top layer is
+    // not drawn but is still part of its layout and refresh work, and parked there it made every
+    // frame on every tab ~2x slower (Settings scroll 55 -> 105 ms). An unloaded screen is never
+    // laid out, invalidated or drawn.
+    static lv_obj_t* s_appdrawer_park_scr = nullptr;
+    if (!s_appdrawer_park_scr) s_appdrawer_park_scr = lv_obj_create(nullptr);
+    lv_obj_set_parent(s_appdrawer_parked, s_appdrawer_park_scr);
   }
   appDrawerCoverContent(false);
 }
@@ -62260,6 +62267,7 @@ static void openAppDrawerOrRestore() {
   if (s_appdrawer_parked && !s_appdrawer_root && s_appdrawer_parked_key == appDrawerBuildKey()) {
     s_appdrawer_root   = s_appdrawer_parked;
     s_appdrawer_parked = nullptr;
+    lv_obj_set_parent(s_appdrawer_root, lv_layer_top());   // back from the parking screen
     lv_obj_clear_flag(s_appdrawer_root, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(s_appdrawer_root);
     appDrawerCoverContent(true);
