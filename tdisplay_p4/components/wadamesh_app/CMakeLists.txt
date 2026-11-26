@@ -19,7 +19,7 @@ file(GLOB LUA_SRCS "${REPO}/lib/lua/src/*.c")
 idf_component_register(
   SRCS ${APP_SRCS} ${LUA_SRCS}
   INCLUDE_DIRS "${APP}" "${APP}/ui-touch" "${REPO}/include" "${REPO}/variants/tdisplay_p4" "${REPO}/lib/lua/src"
-  REQUIRES espressif__arduino-esp32 meshcore lvgl ardlibs RadioLib nvs_flash esp_lcd fatfs
+  REQUIRES espressif__arduino-esp32 meshcore lvgl ardlibs RadioLib nvs_flash esp_lcd fatfs esp_driver_ppa
            esp_driver_i2c esp_driver_gpio esp_hosted h2zero__esp-nimble-cpp bt
            soc esp_hw_support app_update driver esp_timer esp_partition spi_flash esp_adc esp_pm espcoredump
            c6_at   # C6WifiShim facade (WiFi.* -> AT-over-SDIO; UITask + WifiRuntimeStore include it)

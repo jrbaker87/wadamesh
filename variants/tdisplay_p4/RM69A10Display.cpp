@@ -107,6 +107,47 @@ constexpr int     kFbW = 568, kFbH = 1232;
 #define DB_ADD(field, t0) do {} while (0)
 #endif
 
+#if defined(TDP4_EXP_PPA)
+// ---- Experiment: 2x upscale on the PPA (WADA_P4_EXP_PPA=1) ----------------------------------------
+// The SRM engine scales the LVGL band straight into the back buffer by DMA instead of the CPU loop.
+// Cache rules (esp_driver_ppa ppa_srm.c): it writes the input back and INVALIDATES the output's
+// whole-row window before the transfer, so CPU-written rows of a framebuffer (row catch-up copies,
+// CPU-upscaled fallback bands) must be written back first or the invalidate drops them.
+#include "driver/ppa.h"
+static ppa_client_handle_t s_ppa = nullptr;
+static bool s_ppa_failed = false;
+static inline void dbCpuRowsWriteBack(uint8_t* fb, int r0, int r1) {   // rows [r0, r1]
+  if (r1 < r0) return;
+  esp_cache_msync(fb + (size_t)r0 * kFbW * 2, (size_t)(r1 - r0 + 1) * kFbW * 2,
+                  ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+}
+static bool dbUpscalePpa(uint8_t* fb, int nx, int ny, const uint16_t* src, int w, int h) {
+  if (s_ppa_failed) return false;
+  if (!s_ppa) {
+    ppa_client_config_t cc = {};
+    cc.oper_type = PPA_OPERATION_SRM;
+    if (ppa_register_client(&cc, &s_ppa) != ESP_OK) { s_ppa_failed = true; printf("[RM69A10] PPA: no SRM client, CPU upscale\n"); return false; }
+    printf("[RM69A10] PPA SRM upscale on\n");
+  }
+  ppa_srm_oper_config_t op = {};
+  op.in.buffer = src;  op.in.pic_w = (uint32_t)w; op.in.pic_h = (uint32_t)h;
+  op.in.block_w = (uint32_t)w; op.in.block_h = (uint32_t)h; op.in.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
+  op.out.buffer = fb;  op.out.buffer_size = (uint32_t)kFbW * kFbH * 2;
+  op.out.pic_w = kFbW; op.out.pic_h = kFbH;
+  op.out.block_offset_x = (uint32_t)nx; op.out.block_offset_y = (uint32_t)ny; op.out.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
+  op.rotation_angle = PPA_SRM_ROTATION_ANGLE_0;
+  op.scale_x = 2.0f; op.scale_y = 2.0f;
+  op.mode = PPA_TRANS_MODE_BLOCKING;
+  const esp_err_t e = ppa_do_scale_rotate_mirror(s_ppa, &op);
+  if (e != ESP_OK) {
+    static bool logged = false;
+    if (!logged) { logged = true; printf("[RM69A10] PPA SRM failed (%s), CPU upscale for that band\n", esp_err_to_name(e)); }
+    return false;
+  }
+  return true;
+}
+#endif
+
 #if !defined(TDP4_EXP_TRIPLEFB)
 static bool IRAM_ATTR rm69a10RefreshDone(esp_lcd_panel_handle_t, esp_lcd_dpi_panel_event_data_t*, void*) {
   BaseType_t hpw = pdFALSE;
@@ -162,6 +203,10 @@ static void dbBlit(int x, int y, int w, int h, const uint16_t* src, int S) {
   if (ny < s_ymin) s_ymin = ny;
   if (ny + nh - 1 > s_ymax) s_ymax = ny + nh - 1;
   DB_T0(pf_u0);
+#if defined(TDP4_EXP_PPA)
+  if (!fullw) dbCpuRowsWriteBack(back, ny, ny + nh - 1);   // catch-up copies must reach memory before the PPA invalidate
+  if (S == 2 && nh == h * 2 && dbUpscalePpa(back, nx, ny, src, w, h)) { DB_ADD(upscale, pf_u0); return; }
+#endif
   for (int sr = 0; sr < h && sr * S < nh; ++sr) {
     const uint16_t* s = src + (size_t)sr * w;
     uint16_t* d = (uint16_t*)(back + ((size_t)(ny + sr * S) * kFbW + nx) * 2);
@@ -173,6 +218,9 @@ static void dbBlit(int x, int y, int w, int h, const uint16_t* src, int S) {
       memcpy(d, s, (size_t)w * 2);
     }
   }
+#if defined(TDP4_EXP_PPA)
+  dbCpuRowsWriteBack(back, ny, ny + nh - 1);   // a CPU-upscaled band, before any later PPA invalidate
+#endif
   DB_ADD(upscale, pf_u0);
 }
 
@@ -266,6 +314,10 @@ static void dbBlit(int x, int y, int w, int h, const uint16_t* src, int S) {
   if (ny < s_ymin) s_ymin = ny;
   if (ny + nh - 1 > s_ymax) s_ymax = ny + nh - 1;
   DB_T0(pf_u0);
+#if defined(TDP4_EXP_PPA)
+  if (!fullw) dbCpuRowsWriteBack(back, ny, ny + nh - 1);   // catch-up copies must reach memory before the PPA invalidate
+  if (S == 2 && nh == h * 2 && dbUpscalePpa(back, nx, ny, src, w, h)) { DB_ADD(upscale, pf_u0); return; }
+#endif
   for (int sr = 0; sr < h && sr * S < nh; ++sr) {
     const uint16_t* s = src + (size_t)sr * w;
     uint16_t* d = (uint16_t*)(back + ((size_t)(ny + sr * S) * kFbW + nx) * 2);
@@ -277,6 +329,9 @@ static void dbBlit(int x, int y, int w, int h, const uint16_t* src, int S) {
       memcpy(d, s, (size_t)w * 2);
     }
   }
+#if defined(TDP4_EXP_PPA)
+  dbCpuRowsWriteBack(back, ny, ny + nh - 1);   // a CPU-upscaled band, before any later PPA invalidate
+#endif
   DB_ADD(upscale, pf_u0);
 }
 
