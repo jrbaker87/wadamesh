@@ -6,6 +6,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include "P4I2c1.h"
+#include "P4PerfTrace.h"
 
 // Pins and addresses: LilyGo t_display_p4_config.h, as camillia-mt uses them.
 #define P4KB_TCA_ADDR       0x34
@@ -317,6 +318,7 @@ void p4KeyboardPoll() {
   const bool drain_due = s_present && (int_active || (now - s_last_drain_ms) >= kIdlePollMs);
 
   if (probe || drain_due) {
+    P4PERF_SCOPE(probe ? "kb poll (probe)" : "kb poll (drain)");
     if (TwoWire* w = p4I2c1Acquire(P4_I2C1_KEYBOARD, kBusWaitMs)) {
       if (probe) {
         // Back off while nothing is there. The probe is a real I2C transaction,
@@ -328,8 +330,11 @@ void p4KeyboardPoll() {
         // just takes up to that long to notice.
         s_next_probe_ms = now + (s_misses >= kMissesBeforeBackoff ? kHotplugIdleMs
                                                                   : kHotplugMs);
-        uint8_t cfg = 0;
-        const bool there = regRead(w, P4KB_EXP_ADDR, XL_CFG0, cfg);
+        // Address-only probe (i2c_master_probe): an empty bus is a quiet NACK. The register read
+        // used before reported that NACK as ESP_ERR_INVALID_STATE and Arduino logged two [E]
+        // lines for it on every probe.
+        w->beginTransmission(P4KB_EXP_ADDR);
+        const bool there = (w->endTransmission() == 0);
         if (there) s_misses = 0;
         else if (s_misses < kMissesBeforeBackoff) ++s_misses;
         // One-shot bus scan on the first probe. "It does not work" on this

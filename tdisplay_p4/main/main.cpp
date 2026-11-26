@@ -555,6 +555,12 @@ static uint32_t httpDateProbe(void) {
   return (uint32_t)(days * 86400L + hh * 3600 + mm * 60 + ss);
 }
 
+#if defined(TDP4_PERF_TRACE)
+// UITask.cpp's field-freeze tracer (C++ linkage: declared here, outside app_main's extern "C").
+void stallLog(const char* tag, uint32_t dur_ms);
+extern const char* g_ui_stall_tag;
+extern uint16_t    g_ui_stall_max;
+#endif
 extern "C" void app_main(void) {
   // Before anything else registers a shutdown handler: a software restart must be a full system
   // reset or the panel comes back dark (see target.cpp).
@@ -577,6 +583,13 @@ extern "C" void app_main(void) {
     ui_task.loop();
 #if defined(TDP4_PERF_TRACE)
     const int64_t pf_loop1 = p4perf::now();
+    {   // name the UITask::loop section behind a slow pass (uiCp checkpoints; src/main.cpp does this too)
+      const uint32_t pf_ui_ms = (uint32_t)((pf_loop1 - pf_loop0) / 1000);
+      if (pf_ui_ms >= 200) {
+        stallLog((g_ui_stall_max >= 150 && g_ui_stall_tag[0]) ? g_ui_stall_tag : "ui:other", pf_ui_ms);
+        printf("[P4PERF]   slowest ui section %s %u ms\n", g_ui_stall_tag[0] ? g_ui_stall_tag : "?", (unsigned)g_ui_stall_max);
+      }
+    }
 #endif
     if (wifi_crash_guard::tick()) ui_task.showAlert(TR("Wi-Fi was switched off because the device crashed while it was on. Turn it on in Settings > Wi-Fi to try again."), 9000);
     {   // the screen coming back on asks for one prompt rejoin if the link is down (#685)
