@@ -58,6 +58,7 @@ static bool IRAM_ATTR rm69a10TransDone(esp_lcd_panel_handle_t, esp_lcd_dpi_panel
 // the end of the frame being scanned (esp_lcd_panel_dpi.c, dma_trans_done_cb), i.e. on a vsync.
 // The old front becomes the new back, so before it is written it must catch up with the frame it
 // missed: only rows painted last frame differ, and rows this frame repaints in full need no copy.
+#if !defined(TDP4_EXP_TRIPLEFB)
 namespace {
 uint8_t*          s_fb[2]        = {nullptr, nullptr};
 int               s_front        = 0;       // buffer being scanned (or about to be, once the swap lands)
@@ -71,6 +72,32 @@ uint8_t           s_dirty[1232];            // rows painted in the frame being c
 int               s_ymin = 0, s_ymax = -1;
 constexpr int     kFbW = 568, kFbH = 1232;
 }  // namespace
+#else
+// ---- Experiment: triple-buffered framebuffer (WADA_P4_EXP_TRIPLEFB=1, needs DBLFB) ---------------
+// Double buffering makes every frame wait at its start until the previous swap has landed (the
+// old front is the only buffer to draw into), which measured 9-15 ms of a 40-50 ms scroll frame.
+// With three buffers there is always one that is neither on screen (front) nor handed to the
+// driver and waiting for the next vsync (pending), so composing starts at once. A present waits
+// only if the previous frame still has not reached the screen. The driver switches buffers in its
+// frame-end ISR (dma_trans_done_cb restarts the DMA on cur_fb_index, then calls on_refresh_done);
+// pending is set AFTER draw_bitmap returns, the same arming the double buffer uses.
+// Each buffer tracks the rows it lacks of the newest frame; they are copied from that frame
+// (s_latest) only where this frame does not repaint them in full.
+namespace {
+constexpr int     kNumFb = 3;
+uint8_t*          s_fb[kNumFb]   = {nullptr, nullptr, nullptr};
+volatile int      s_front        = 0;      // being scanned
+volatile int      s_pending      = -1;     // presented, not on screen yet (-1: none)
+int               s_latest       = 0;      // the newest complete frame (pending, else front)
+int               s_back         = -1;     // being composed
+SemaphoreHandle_t s_swap_sem     = nullptr;
+bool              s_open         = false;
+uint8_t           s_stale[kNumFb][1232];   // rows buffer i lacks of the newest frame
+uint8_t           s_dirty[1232];           // rows painted in the frame being composed
+int               s_ymin = 0, s_ymax = -1;
+constexpr int     kFbW = 568, kFbH = 1232;
+}  // namespace
+#endif
 
 #if defined(TDP4_PERF_TRACE)
 #define DB_T0(v) const int64_t v = p4perf::now()
@@ -80,6 +107,7 @@ constexpr int     kFbW = 568, kFbH = 1232;
 #define DB_ADD(field, t0) do {} while (0)
 #endif
 
+#if !defined(TDP4_EXP_TRIPLEFB)
 static bool IRAM_ATTR rm69a10RefreshDone(esp_lcd_panel_handle_t, esp_lcd_dpi_panel_event_data_t*, void*) {
   BaseType_t hpw = pdFALSE;
   if (s_swap_isr_pending) { s_swap_isr_pending = false; xSemaphoreGiveFromISR(s_swap_sem, &hpw); }
@@ -174,6 +202,121 @@ static void dbPresent(esp_lcd_panel_handle_t panel) {
   s_swap_pending = true;
   memcpy(s_prev_dirty, s_dirty, sizeof s_dirty);
 }
+#else  // TDP4_EXP_TRIPLEFB
+static bool IRAM_ATTR rm69a10RefreshDone(esp_lcd_panel_handle_t, esp_lcd_dpi_panel_event_data_t*, void*) {
+  BaseType_t hpw = pdFALSE;
+  const int p = s_pending;
+  if (p >= 0) {
+    s_front = p;          // front first, then clear pending (dbOpen reads them in the other order)
+    s_pending = -1;
+    xSemaphoreGiveFromISR(s_swap_sem, &hpw);
+  }
+  return hpw == pdTRUE;
+}
+
+// Start composing: take the buffer that is neither on screen nor waiting to be. Never waits.
+static void dbOpen() {
+  if (s_open) return;
+  const int p = s_pending;                 // pending BEFORE front: see rm69a10RefreshDone
+  __asm__ __volatile__("" ::: "memory");
+  const int f = s_front;
+  int b = -1, best = kFbH + 1;
+  for (int i = 0; i < kNumFb; ++i) {
+    if (i == f || i == p) continue;
+    int n = 0;
+    for (int r = 0; r < kFbH; ++r) n += s_stale[i][r];
+    if (n < best) { best = n; b = i; }     // fewest rows to catch up
+  }
+  s_back = b;
+  memset(s_dirty, 0, sizeof s_dirty);
+  s_ymin = kFbH; s_ymax = -1;
+  s_open = true;
+}
+
+static inline void dbRowCopy(int r) {
+  const size_t o = (size_t)r * kFbW * 2;
+  memcpy(s_fb[s_back] + o, s_fb[s_latest] + o, (size_t)kFbW * 2);
+}
+
+static void dbBlit(int x, int y, int w, int h, const uint16_t* src, int S) {
+  dbOpen();
+  int nx = x * S, ny = y * S, nw = w * S, nh = h * S;
+  if (nx < 0 || nx + nw > kFbW || ny < 0) return;
+  if (ny + nh > kFbH) nh = kFbH - ny;
+  const bool fullw = (nx == 0 && nw >= kFbW);
+  uint8_t* back = s_fb[s_back];
+  uint8_t* stale = s_stale[s_back];
+  DB_T0(pf_r0);
+  for (int r = ny; r < ny + nh; ++r) {
+    if (stale[r]) {
+      if (!fullw) {
+        dbRowCopy(r);
+#if defined(TDP4_PERF_TRACE)
+        ++p4perf::fr.rows;
+#endif
+      }
+      stale[r] = 0;
+    }
+    s_dirty[r] = 1;
+  }
+  DB_ADD(rowcopy, pf_r0);
+#if defined(TDP4_PERF_TRACE)
+  ++p4perf::fr.bands;
+#endif
+  if (ny < s_ymin) s_ymin = ny;
+  if (ny + nh - 1 > s_ymax) s_ymax = ny + nh - 1;
+  DB_T0(pf_u0);
+  for (int sr = 0; sr < h && sr * S < nh; ++sr) {
+    const uint16_t* s = src + (size_t)sr * w;
+    uint16_t* d = (uint16_t*)(back + ((size_t)(ny + sr * S) * kFbW + nx) * 2);
+    if (S == 2) {
+      uint32_t* d32 = (uint32_t*)d;
+      for (int i = 0; i < w; ++i) { const uint32_t c = s[i]; d32[i] = c | (c << 16); }
+      if (sr * S + 1 < nh) memcpy(d + kFbW, d, (size_t)nw * 2);
+    } else {
+      memcpy(d, s, (size_t)w * 2);
+    }
+  }
+  DB_ADD(upscale, pf_u0);
+}
+
+static void dbPresent(esp_lcd_panel_handle_t panel) {
+  if (!s_open) return;
+  uint8_t* stale = s_stale[s_back];
+  DB_T0(pf_p0);
+  for (int r = 0; r < kFbH; ++r) {
+    if (!stale[r]) continue;
+    dbRowCopy(r); stale[r] = 0;
+#if defined(TDP4_PERF_TRACE)
+    ++p4perf::fr.rows;
+#endif
+    if (r < s_ymin) s_ymin = r;
+    if (r > s_ymax) s_ymax = r;
+  }
+  DB_ADD(rowcopy, pf_p0);
+  s_open = false;
+  if (s_ymax < s_ymin) return;                       // nothing was painted
+  // One frame in flight at most: if the previous one is not on screen yet, wait for it (a later
+  // present must not replace a buffer the ISR may already have started scanning).
+  DB_T0(pf_w0);
+  while (s_pending >= 0) {
+    if (xSemaphoreTake(s_swap_sem, pdMS_TO_TICKS(100)) != pdTRUE) {   // no vsync for 100 ms: carry on
+      s_front = s_pending; s_pending = -1; break;
+    }
+  }
+  DB_ADD(wait, pf_w0);
+  DB_T0(pf_b0);
+  esp_lcd_panel_draw_bitmap(panel, 0, s_ymin, kFbW, s_ymax + 1, s_fb[s_back]);   // write back + select
+  DB_ADD(writeback, pf_b0);
+  for (int i = 0; i < kNumFb; ++i) {
+    if (i == s_back) continue;
+    for (int r = 0; r < kFbH; ++r) s_stale[i][r] |= s_dirty[r];
+  }
+  s_latest = s_back;
+  __asm__ __volatile__("" ::: "memory");
+  s_pending = s_back;                                 // armed AFTER the call, as the double buffer does
+}
+#endif  // TDP4_EXP_TRIPLEFB
 #endif  // TDP4_EXP_DBLFB
 
 // RM69A10 DSI timing — LilyGo rm69a10_driver.h (values confirmed via t_display_p4_config.h).
@@ -248,7 +391,9 @@ bool RM69A10Display::begin() {
     .dpi_clk_src = MIPI_DSI_DPI_CLK_SRC_DEFAULT,
     .dpi_clock_freq_mhz = RM_DPI_MHZ,
     .pixel_format = LCD_COLOR_PIXEL_FORMAT_RGB565,
-#if defined(TDP4_EXP_DBLFB)
+#if defined(TDP4_EXP_TRIPLEFB)
+    .num_fbs = 3,
+#elif defined(TDP4_EXP_DBLFB)
     .num_fbs = 2,
 #else
     .num_fbs = 1,
@@ -285,6 +430,21 @@ bool RM69A10Display::begin() {
   // 39 back-to-back DMA transfers into a buffer the panel is scanning out.
 #if defined(TDP4_EXP_DBLFB)
   {
+#if defined(TDP4_EXP_TRIPLEFB)
+    void *fb0 = nullptr, *fb1 = nullptr, *fb2 = nullptr;
+    if (esp_lcd_dpi_panel_get_frame_buffer(_panel, 3, &fb0, &fb1, &fb2) != ESP_OK || !fb0 || !fb1 || !fb2) {
+      Serial.println("[RM69A10] TRIPLEFB: no third framebuffer"); return false;
+    }
+    s_fb[0] = (uint8_t*)fb0; s_fb[1] = (uint8_t*)fb1; s_fb[2] = (uint8_t*)fb2;
+    s_front = 0; s_pending = -1; s_latest = 0;
+    memset(s_stale, 0, sizeof s_stale);
+    const size_t fb_bytes = (size_t)RM_W * RM_H * 2;
+    memset(fb0, 0, fb_bytes); memset(fb1, 0, fb_bytes); memset(fb2, 0, fb_bytes);
+    esp_cache_msync(fb0, fb_bytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+    esp_cache_msync(fb1, fb_bytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+    esp_cache_msync(fb2, fb_bytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+    Serial.println("[RM69A10] triple-buffered framebuffer");
+#else
     void *fb0 = nullptr, *fb1 = nullptr;
     if (esp_lcd_dpi_panel_get_frame_buffer(_panel, 2, &fb0, &fb1) != ESP_OK || !fb0 || !fb1) {
       Serial.println("[RM69A10] DBLFB: no second framebuffer"); return false;
@@ -294,6 +454,7 @@ bool RM69A10Display::begin() {
     memset(fb0, 0, fb_bytes); memset(fb1, 0, fb_bytes);
     esp_cache_msync(fb0, fb_bytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
     esp_cache_msync(fb1, fb_bytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+#endif
     s_swap_sem = xSemaphoreCreateBinary();
   }
   void* fb = nullptr;

@@ -81188,13 +81188,15 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
       // AMOLED (RM69A10) = 284-wide; TFT-LCD (HI8561) = 270-wide.
     #if defined(HAS_TDP4_LCD)
       g_draw_buf_px = 270 * LV_DRAW_BUF_LINES;
-    #elif defined(TDP4_BAND_LINES)
-      // Experiment (WADA_P4_EXP_BAND_LINES=<n>): taller draw band. LVGL walks the object tree and
-      // resolves styles again for every band; at 24 lines a full frame is 26 bands, and that
-      // per-band overhead measured 2-4x the actual drawing.
-      g_draw_buf_px = 284 * TDP4_BAND_LINES;
     #else
-      g_draw_buf_px = 284 * LV_DRAW_BUF_LINES;
+      // Taller draw band than the shared 24 lines: LVGL walks the object tree and resolves styles
+      // again for every band, and at 24 lines a full frame is 26 bands. 154 lines (4 bands, 87 KB of
+      // PSRAM) saved ~10 ms per tab-switch frame and ~8 ms per scroll frame.
+      // WADA_P4_EXP_BAND_LINES=<n> overrides it (24 = the old band).
+      #ifndef TDP4_BAND_LINES
+      #define TDP4_BAND_LINES 154
+      #endif
+      g_draw_buf_px = 284 * TDP4_BAND_LINES;
     #endif
       const size_t buf_bytes = sizeof(lv_color_t) * g_draw_buf_px;
 #if defined(TDP4_EXP_BAND_INTERNAL)
