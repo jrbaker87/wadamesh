@@ -14266,6 +14266,7 @@ static void updateTabIndicator() {
 }
 
 #if defined(TDP4_PERF_TRACE)
+extern "C" void tdisplay_p4_power_trace();   // target.cpp: battery temp/voltage/current line
 // Perf build: time every lv_timer callback. A pass that is slow in "other timers/callbacks" now says
 // WHICH callback, as a code address; decode it with
 //   riscv32-esp-elf-addr2line -pfiaC -e build/tdisplay_p4/application.elf <addr>
@@ -87637,6 +87638,11 @@ void UITask::loop() {
 #elif defined(TDP4_PERF_TRACE)
   {   // T-Display P4 perf build: time the whole LVGL pass and count the bands it flushed
     pfWrapTimers();
+    {   // battery / temperature / charge current every 10 s, to line up with the frame stats
+      static uint32_t pf_pw_ms = 0;
+      const uint32_t pf_now_ms = millis();
+      if (pf_now_ms - pf_pw_ms >= 10000) { pf_pw_ms = pf_now_ms; tdisplay_p4_power_trace(); }
+    }
     const uint32_t pf_fl0 = p4perf::g.flushesTotal;
     const int64_t  pf_t0  = p4perf::now();
     static bool pf_info = false;

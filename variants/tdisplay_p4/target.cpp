@@ -125,6 +125,20 @@ uint16_t TDisplayP4Board::getBattMilliVolts() {
   return last_mv;
 }
 
+#if defined(TDP4_PERF_TRACE)
+// Perf build: one line of battery/thermal state for the power and heat investigation. Reads the
+// BQ27220 gauge: Temperature() 0x06 (0.1 K), Voltage() 0x08, BatteryStatus() 0x0A (raw hex),
+// Current() 0x0C (signed mA, + = charging), RemainingCapacity() 0x10, FullChargeCapacity() 0x12.
+extern "C" void tdisplay_p4_power_trace() {
+  uint16_t tk = 0, mv = 0, st = 0, ci = 0, rem = 0, full = 0;
+  const bool ok = bq27220ReadU16(0x06, tk) && bq27220ReadU16(0x08, mv) && bq27220ReadU16(0x0A, st) &&
+                  bq27220ReadU16(0x0C, ci) && bq27220ReadU16(0x10, rem) && bq27220ReadU16(0x12, full);
+  if (!ok) { printf("[P4PERF] power: gauge read failed\n"); return; }
+  printf("[P4PERF] power: batt %.1f C  %u mV  %d mA  status 0x%04x  %u/%u mAh\n",
+         (double)tk / 10.0 - 273.15, mv, (int)(int16_t)ci, st, rem, full);
+}
+#endif
+
 bool radio_init() {
   fallback_clock.begin();
   rtc_clock.begin(Wire);            // PCF8563 RTC is on I2C_1 (shared Wire, SDA=7/SCL=8)
