@@ -62267,7 +62267,7 @@ static void openAppDrawerOrRestore() {
   if (s_appdrawer_parked && !s_appdrawer_root && s_appdrawer_parked_key == appDrawerBuildKey()) {
     s_appdrawer_root   = s_appdrawer_parked;
     s_appdrawer_parked = nullptr;
-    lv_obj_set_parent(s_appdrawer_root, lv_layer_top());   // back from the parking screen
+    { P4PERF_SCOPE("drawer restore: set_parent"); lv_obj_set_parent(s_appdrawer_root, lv_layer_top()); }   // back from the parking screen
     lv_obj_clear_flag(s_appdrawer_root, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(s_appdrawer_root);
     appDrawerCoverContent(true);
@@ -62284,8 +62284,15 @@ static void openAppDrawerOrRestore() {
 static void setHomeDrawer(bool show) {
   s_home_drawer_mode = show;
   s_tab_changed = false;   // explicit action — don't let a pending switch flag suppress the next Home toggle
-  if (show) { if (!s_appdrawer_root) openAppDrawer(); }
-  else        closeAppDrawer();
+  // Park on hide and restore on show, as a tab switch does: toggling with a Home re-tap
+  // rebuilt the whole grid every time (a ~120 ms frame). Parking hides + reparents, never
+  // deletes, so it is safe from inside the drawer's own events too.
+  if (show) { if (!s_appdrawer_root) openAppDrawerOrRestore(); }
+  else if (s_appdrawer_root) {
+    lv_indev_t* act_in = lv_indev_get_act();
+    if (act_in) lv_indev_wait_release(act_in);   // as closeAppDrawer's popupClose did
+    closeAppDrawerSync();
+  }
 }
 
 #if defined(HAS_TANMATSU)
@@ -62625,8 +62632,14 @@ static void appLaunch(int act, lv_event_t* e) {
 #endif
     default: break;
   }
-  // Navigation tiles: leave the drawer for the chosen tab.
-  closeAppDrawer();
+  // Navigation tiles: leave the drawer for the chosen tab. Leaving Home parks the drawer
+  // (tabChangedCb -> closeAppDrawerSync) instead of deleting it, so the way back does not
+  // rebuild it (~33 ms + a slower first frame). Close it outright only if it is still up
+  // afterwards: opened over another tab, or the tab did not change.
+  {
+    lv_indev_t* act_in = lv_indev_get_act();
+    if (act_in) lv_indev_wait_release(act_in);   // as closeAppDrawer's popupClose did
+  }
   switch (act) {
     case APPACT_CHATS:    goToTab(CHAT_INBOX_TAB_INDEX); break;
     case APPACT_CONTACTS: goToTab(CONTACTS_TAB_INDEX);   break;
@@ -62634,6 +62647,7 @@ static void appLaunch(int act, lv_event_t* e) {
     case APPACT_SETTINGS: goToTab(SETTINGS_TAB_INDEX);   break;
     default: break;
   }
+  if (s_appdrawer_root) closeAppDrawer();
 }
 static void appTileCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
@@ -64866,6 +64880,7 @@ static void updateGlobalStatusBar() {
       // back in front, without having to hook every tool's close path.
       const lv_coord_t sx = lv_obj_get_scroll_x(s_appdrawer_root);
       const lv_coord_t sy = lv_obj_get_scroll_y(s_appdrawer_root);
+      P4PERF_SCOPE("drawer badge rebuild");
       closeAppDrawer();
       openAppDrawer();
       // Rebuilding resets the scroll, so a message arriving while you were
