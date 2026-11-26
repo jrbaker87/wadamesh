@@ -14457,8 +14457,8 @@ static void tabChangedCb(lv_event_t* e) {
 // with, and at its frame rate the 400 ms slide was four or five uneven frames
 // before the tab could be used.
 static lv_anim_enable_t tabSwitchAnim(int idx) {
-#if defined(TLORA_PAGER)
-  (void)idx;
+#if defined(TLORA_PAGER) || defined(TDP4_EXP_TAB_NOANIM)
+  (void)idx;   // T-Display P4 experiment: every slide frame is a full-screen repaint (~60-90 ms each)
   return LV_ANIM_OFF;
 #else
   return idx == MAP_TAB_INDEX ? LV_ANIM_OFF : uiAnimOn();
