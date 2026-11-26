@@ -63,16 +63,22 @@ public:
   }
 
   int available() { int id = link(); return id < 0 ? 0 : c6at_sock_available(id); }
+  // Single-byte read sleeps 1 ms when the ring is empty. Stream::timedRead() (used by readStringUntil,
+  // HTTPClient's header parse, parseInt, find...) spins on it with NO yield until
+  // their timeout; on the prio-1 core-0 tile_fetch task that starved IDLE0 and tripped the task
+  // watchdog. NetworkClient::readBytes() already sleeps between empty bulk reads.
   int read() {
     uint8_t b;
-    return (read(&b, 1) == 1) ? (int)b : -1;
+    if (read(&b, 1) == 1) return (int)b;
+    vTaskDelay(1);
+    return -1;
   }
   int read(uint8_t *buf, size_t size) {
     int id = link();
     if (id < 0) return -1;
     return c6at_sock_read(id, buf, size);   // 0 = nothing yet (caller's timeout loop retries)
   }
-  int peek() { int id = link(); return id < 0 ? -1 : c6at_sock_peek(id); }
+  int peek() { int id = link(); return id < 0 ? -1 : c6at_sock_peek(id); }   // non-blocking: the P4 router polls it
   void flush() {}   // writes are synchronous through the worker — nothing buffered host-side
 
   void stop() {     // hard close for ALL copies sharing this link (WiFiClient::stop semantics)

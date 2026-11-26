@@ -14167,6 +14167,7 @@ static void ctExitSelectMode();  // fwd — leave Contacts multi-select if it is
 static void closeMentionsScreen();           // fwd — @-mentions screen (defined with the drawer)
 static void openMentionsScreen();            // fwd — same
 static void closeAppDrawerSync();            // fwd — synchronous drawer close (safe outside the drawer's own event)
+static void openAppDrawerOrRestore();        // fwd — reuse the drawer parked by closeAppDrawerSync, else build it
 static lv_obj_t* s_mentions_root = nullptr;  // @-mentions list overlay
 // The Home tab shows the command centre OR the app drawer; remember which so
 // leaving Home and coming back restores the same view. Toggled by the Home tab
@@ -14313,8 +14314,10 @@ static void tabChangedCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
   // One tap can deliver VALUE_CHANGED twice (the bubbled btnmatrix event plus a second one for the
   // same tab), and each pass costs ~25+ ms of rebuild. Drop a repeat for the tab we just handled
-  // within 250 ms; the first pass already did all of the work.
+  // within 250 ms of the first pass FINISHING (a Map activation alone can take 350 ms, so timing
+  // from its start let the duplicate through); the first pass already did all of the work.
   static uint32_t s_tcb_last_ms = 0;
+  struct StampOnExit { ~StampOnExit() { s_tcb_last_ms = lv_tick_get(); if (!s_tcb_last_ms) s_tcb_last_ms = 1; } };
   {
     const int t_now = getActiveTab();
 #if defined(TDP4_PERF_TRACE)
@@ -14330,8 +14333,7 @@ static void tabChangedCb(lv_event_t* e) {
       return;
     }
   }
-  s_tcb_last_ms = lv_tick_get();
-  if (s_tcb_last_ms == 0) s_tcb_last_ms = 1;
+  StampOnExit stamp_on_exit;   // declared before the perf scope: stamps after everything below ran
   P4PERF_SCOPE("tabChangedCb (whole)");
 #if defined(TLORA_PAGER)
   navTabMemLeaving();   // first: closeSettingsModal below empties the focus group
@@ -14389,7 +14391,7 @@ static void tabChangedCb(lv_event_t* e) {
     // Returned to Home in drawer mode (or drawer-as-home pref) -> restore it (NO toggle
     // here). The mode follows, or the next Home press "opened" the open drawer and
     // only the second one reached the widgets.
-    if (s_home_drawer_mode || s_home_is_drawer) { s_home_drawer_mode = true; P4PERF_SCOPE("openAppDrawer"); openAppDrawer(); }
+    if (s_home_drawer_mode || s_home_is_drawer) { s_home_drawer_mode = true; P4PERF_SCOPE("openAppDrawer"); openAppDrawerOrRestore(); }
   } else if (new_t != HOME_TAB_INDEX && prev_t == HOME_TAB_INDEX) {
   { P4PERF_SCOPE("closeAppDrawerSync"); closeAppDrawerSync(); }  // leaving Home -> hide (mode kept); sync so the map can't paint under it
     if (s_hw_arrange) hwArrangeDone();           // ...and Arrange is done (saved)
@@ -14406,7 +14408,7 @@ static void tabChangedCb(lv_event_t* e) {
 #if defined(HAS_THINKNODE_M9)
     s_map_loading = true;
 #endif
-    applyMapChrome(true);    // transparent status bar + tab bar so the map shows through
+    { P4PERF_SCOPE("applyMapChrome"); applyMapChrome(true); }    // transparent status bar + tab bar so the map shows through
   { P4PERF_SCOPE("onMapTabActivated"); onMapTabActivated(); }
   } else {
     if (prev_t == MAP_TAB_INDEX) applyMapChrome(false);   // restore opaque chrome
@@ -35963,6 +35965,13 @@ static lv_obj_t* appDrawerRoot() { return s_appdrawer_root; }   // for navOnMain
 // Badge counts baked into the drawer grid when it was last built, so the
 // refresh tick can tell whether they still match reality (see #393).
 static uint32_t  s_appdrawer_badge_sig = 0;
+// Leaving Home parks the drawer (hidden, kept) instead of deleting it, so coming back does not
+// rebuild the whole grid (~33 ms on the P4, incl. an SD scan of installed Lua apps). Kept apart
+// from s_appdrawer_root, which everywhere means "the drawer is up". Reused only while the
+// settings that shape the grid are unchanged (appDrawerBuildKey); the badge tick in
+// updateGlobalStatusBar refreshes counts once it is the live drawer again.
+static lv_obj_t* s_appdrawer_parked = nullptr;
+static uint32_t  s_appdrawer_parked_key = 0;
 
 // Is anything drawn in front of the app drawer? Tools and Lua apps are children
 // of the same layer and open over it without closing it, so "the drawer exists"
@@ -44152,7 +44161,7 @@ static void onMapTabActivated() {
     lv_label_set_text(s_map_status_lbl, TR("Loading map\xe2\x80\xa6"));
     lv_obj_clear_flag(s_map_status_lbl, LV_OBJ_FLAG_HIDDEN);
   }
-  lv_refr_now(NULL);   // drain one frame so the label reaches the panel before we block
+  { P4PERF_SCOPE("map: lv_refr_now (Loading hint)"); lv_refr_now(NULL); }   // drain one frame so the label reaches the panel before we block
   // The entire UI is now clocked at 160 MHz from UITask::begin, so there's
   // no per-tab boost dance here anymore. (Tried 240 MHz briefly — the
   // PSRAM bus tightens enough at that clock for the SJPG decoder to
@@ -44189,15 +44198,15 @@ static void onMapTabActivated() {
     // bestAvailableZoom has no other caller, so this is pure dead-work removal.
     const bool centred = !(s_map_center_lat == 0.0 && s_map_center_lon == 0.0);
     const uint8_t best = (have_saved_zoom || !centred)
-                       ? 0 : bestAvailableZoom(s_map_center_lat, s_map_center_lon);
+                       ? 0 : [&]{ P4PERF_SCOPE("map: bestAvailableZoom"); return bestAvailableZoom(s_map_center_lat, s_map_center_lon); }();
     if (best != 0 && !have_saved_zoom) s_map_zoom = best;
     if (centred) s_map_view_inited = true;
   }
   // (The "Loading map…" hint + frame flush moved to the top of this function —
   // it has to precede the zoom probe above, not just the tile reads below.)
-  renderMapTiles();
-  renderMapMarkers();
-  refreshMapInfoLabel();
+  { P4PERF_SCOPE("map: renderMapTiles"); renderMapTiles(); }
+  { P4PERF_SCOPE("map: renderMapMarkers"); renderMapMarkers(); }
+  { P4PERF_SCOPE("map: refreshMapInfoLabel"); refreshMapInfoLabel(); }
   if (s_map_loading) {
     s_map_loading = false;
     if (getActiveTab() == MAP_TAB_INDEX) applyMapChrome(true);   // tab bar back to its map colours
@@ -62164,9 +62173,23 @@ static uint32_t appTileColor(uint8_t hue) { return hue == kAppHueDanger ? COLOR_
 static void hwGridSetHidden(bool hidden);   // (with the Home widgets)
 static void appDrawerCoverContent(bool cover) { hwGridSetHidden(cover); }
 static void appDrawerDeleteCb(lv_event_t* e) {
+  if (lv_event_get_target(e) == s_appdrawer_parked) { s_appdrawer_parked = nullptr; return; }   // parked: covers nothing
   // A drawer replaced by a new one is deleted after the new one is up: only the last
   // one going shows the content again.
   if (!s_appdrawer_root || lv_event_get_target(e) == s_appdrawer_root) appDrawerCoverContent(false);
+}
+
+// What the grid's layout and tiles depend on, apart from the badges (see s_appdrawer_parked).
+static uint32_t appDrawerBuildKey() {
+  uint32_t k = touchPrefsGetAppHide();
+  k = k * 31u + i18nGetLang();
+  k = k * 31u + s_theme_mode;
+  k = k * 31u + ((uint32_t)s_theme_day << 1 | (uint32_t)s_theme_high_contrast);
+  k = k * 31u + ((uint32_t)s_look_more << 1 | (uint32_t)s_look_rainbow);
+  k = k * 31u + (uint32_t)touchPrefsGetAppGridLarge();
+  k = k * 31u + ((uint32_t)s_nav_rail << 2 | (uint32_t)s_nav_left << 1 | (uint32_t)s_nav_top);
+  k = k * 31u + (uint32_t)tabContentW();
+  return k;
 }
 
 static void closeAppDrawer() {
@@ -62193,8 +62216,30 @@ static void closeAppDrawerSync() {
   // popupClose() deletes on the next LVGL cycle (the scroll UAF guard), so hide the
   // drawer now: until then it still drew, and still counted as a popup open on the
   // top layer, so a Pager shortcut pressed in the same moment (S, then M) was dropped.
-  if (s_appdrawer_root) { lv_obj_add_flag(s_appdrawer_root, LV_OBJ_FLAG_HIDDEN); popupClose(&s_appdrawer_root); }
+  if (s_appdrawer_root) {
+    lv_obj_add_flag(s_appdrawer_root, LV_OBJ_FLAG_HIDDEN);
+    // Park it (hidden, kept) for the next visit to Home instead of deleting it.
+    if (s_appdrawer_parked) popupClose(&s_appdrawer_parked);
+    s_appdrawer_parked     = s_appdrawer_root;
+    s_appdrawer_parked_key = appDrawerBuildKey();
+    s_appdrawer_root       = nullptr;
+  }
   appDrawerCoverContent(false);
+}
+
+// Back on Home in drawer mode: bring the parked drawer back if it still matches, else build anew.
+static void openAppDrawerOrRestore() {
+  if (s_appdrawer_parked && !s_appdrawer_root && s_appdrawer_parked_key == appDrawerBuildKey()) {
+    s_appdrawer_root   = s_appdrawer_parked;
+    s_appdrawer_parked = nullptr;
+    lv_obj_clear_flag(s_appdrawer_root, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_appdrawer_root);
+    appDrawerCoverContent(true);
+    if (s_settings_sheet) { s_settings_hid_drawer = nullptr; settingsHideDrawer(); }   // as openAppDrawer does
+    return;
+  }
+  if (s_appdrawer_parked) popupClose(&s_appdrawer_parked);
+  openAppDrawer();
 }
 
 // Set the Home tab's view (false = command centre, true = app drawer) and make the
