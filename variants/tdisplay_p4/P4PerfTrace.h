@@ -68,6 +68,18 @@ inline State g;
 
 inline int64_t now() { return esp_timer_get_time(); }
 
+// Per-frame breakdown of the double-buffered flush path (RM69A10Display.cpp), microseconds.
+// Filled while LVGL flushes the bands of one refresh, printed and cleared by onRefr().
+struct Frame {
+  int64_t wait = 0;       // dbOpen: waiting for the previous swap to land
+  int64_t rowcopy = 0;    // copying rows the front has and the back missed (per band + at present)
+  int64_t upscale = 0;    // the 2x nearest-neighbour write of the band into the back buffer
+  int64_t writeback = 0;  // esp_lcd_panel_draw_bitmap: cache write-back + buffer select
+  uint32_t rows = 0;      // rows copied front -> back
+  uint32_t bands = 0;
+};
+inline Frame fr;
+
 // One band went to the panel. up_us = CPU upscale, dma_us = draw_bitmap + wait for the copy.
 inline void onFlush(int64_t up_us, int64_t dma_us, bool timedOut, uint32_t px) {
   g.up.add((uint64_t)up_us);
@@ -84,6 +96,14 @@ inline void onFlush(int64_t up_us, int64_t dma_us, bool timedOut, uint32_t px) {
 inline void onRefr(uint32_t ms, uint32_t /*px*/) {
   g.refr.add((uint64_t)ms * 1000u);
   g.passRefrMs += ms;
+  if (ms >= 40) {
+    const double flush = (double)(fr.wait + fr.rowcopy + fr.upscale + fr.writeback) / 1000.0;
+    printf("[P4PERF]   frame %u ms (%u bands): lvgl draw %.1f | wait-swap %.1f | row-copy %.1f (%u rows) | "
+           "upscale %.1f | writeback %.1f\n",
+           (unsigned)ms, (unsigned)fr.bands, (double)ms - flush, fr.wait / 1000.0, fr.rowcopy / 1000.0,
+           (unsigned)fr.rows, fr.upscale / 1000.0, fr.writeback / 1000.0);
+  }
+  fr = Frame{};
 }
 
 // One lv_timer_handler() call finished. flushesBefore = g.flushesTotal sampled before the call.

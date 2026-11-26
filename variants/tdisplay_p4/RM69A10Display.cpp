@@ -72,6 +72,14 @@ int               s_ymin = 0, s_ymax = -1;
 constexpr int     kFbW = 568, kFbH = 1232;
 }  // namespace
 
+#if defined(TDP4_PERF_TRACE)
+#define DB_T0(v) const int64_t v = p4perf::now()
+#define DB_ADD(field, t0) (p4perf::fr.field += p4perf::now() - (t0))
+#else
+#define DB_T0(v) do {} while (0)
+#define DB_ADD(field, t0) do {} while (0)
+#endif
+
 static bool IRAM_ATTR rm69a10RefreshDone(esp_lcd_panel_handle_t, esp_lcd_dpi_panel_event_data_t*, void*) {
   BaseType_t hpw = pdFALSE;
   if (s_swap_isr_pending) { s_swap_isr_pending = false; xSemaphoreGiveFromISR(s_swap_sem, &hpw); }
@@ -83,7 +91,9 @@ static void dbOpen() {
   if (s_open) return;
   if (s_swap_pending) {
     s_swap_pending = false;
+    DB_T0(pf_w0);
     if (xSemaphoreTake(s_swap_sem, pdMS_TO_TICKS(100)) != pdTRUE) s_swap_isr_pending = false;   // carry on
+    DB_ADD(wait, pf_w0);
   }
   memcpy(s_need, s_prev_dirty, sizeof s_need);
   memset(s_dirty, 0, sizeof s_dirty);
@@ -104,12 +114,26 @@ static void dbBlit(int x, int y, int w, int h, const uint16_t* src, int S) {
   if (ny + nh > kFbH) nh = kFbH - ny;
   const bool fullw = (nx == 0 && nw >= kFbW);
   uint8_t* back = s_fb[1 - s_front];
+  DB_T0(pf_r0);
   for (int r = ny; r < ny + nh; ++r) {
-    if (s_need[r]) { if (!fullw) dbRowCopy(r); s_need[r] = 0; }   // a full-width band overwrites the row anyway
+    if (s_need[r]) {
+      if (!fullw) {
+        dbRowCopy(r);
+#if defined(TDP4_PERF_TRACE)
+        ++p4perf::fr.rows;
+#endif
+      }
+      s_need[r] = 0;
+    }   // a full-width band overwrites the row anyway
     s_dirty[r] = 1;
   }
+  DB_ADD(rowcopy, pf_r0);
+#if defined(TDP4_PERF_TRACE)
+  ++p4perf::fr.bands;
+#endif
   if (ny < s_ymin) s_ymin = ny;
   if (ny + nh - 1 > s_ymax) s_ymax = ny + nh - 1;
+  DB_T0(pf_u0);
   for (int sr = 0; sr < h && sr * S < nh; ++sr) {
     const uint16_t* s = src + (size_t)sr * w;
     uint16_t* d = (uint16_t*)(back + ((size_t)(ny + sr * S) * kFbW + nx) * 2);
@@ -121,22 +145,30 @@ static void dbBlit(int x, int y, int w, int h, const uint16_t* src, int S) {
       memcpy(d, s, (size_t)w * 2);
     }
   }
+  DB_ADD(upscale, pf_u0);
 }
 
 // The frame is complete: bring untouched rows up to date, write the buffer back and request the swap.
 static void dbPresent(esp_lcd_panel_handle_t panel) {
   if (!s_open) return;
+  DB_T0(pf_p0);
   for (int r = 0; r < kFbH; ++r) {
     if (!s_need[r]) continue;
     dbRowCopy(r); s_need[r] = 0;
+#if defined(TDP4_PERF_TRACE)
+    ++p4perf::fr.rows;
+#endif
     if (r < s_ymin) s_ymin = r;
     if (r > s_ymax) s_ymax = r;
   }
+  DB_ADD(rowcopy, pf_p0);
   s_open = false;
   if (s_ymax < s_ymin) return;                       // nothing was painted
   xSemaphoreTake(s_swap_sem, 0);                      // drop a stale signal
   s_swap_isr_pending = false;
+  DB_T0(pf_b0);
   esp_lcd_panel_draw_bitmap(panel, 0, s_ymin, kFbW, s_ymax + 1, s_fb[1 - s_front]);   // write back + select
+  DB_ADD(writeback, pf_b0);
   s_front = 1 - s_front;
   s_swap_isr_pending = true;                          // armed AFTER the call: at worst one extra refresh of wait
   s_swap_pending = true;
