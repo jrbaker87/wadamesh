@@ -6446,6 +6446,8 @@ static void lvglFlush(lv_disp_drv_t* disp_drv, const lv_area_t* area, lv_color_t
 static void lvglFlushImpl(lv_disp_drv_t* disp_drv, const lv_area_t* area, lv_color_t* color_p) {
   (void)disp_drv;
   if (!color_p) { lv_disp_flush_ready(disp_drv); return; }   // never deref a NULL draw buffer (OOM at boot)
+  bool flush_async = false;   // set by the P4 PPA-async flush (signals flush-ready from its ISR)
+  (void)flush_async;
   int32_t w = area->x2 - area->x1 + 1;
   int32_t h = area->y2 - area->y1 + 1;
 #if !defined(HAS_TANMATSU)
@@ -6497,8 +6499,9 @@ static void lvglFlushImpl(lv_disp_drv_t* disp_drv, const lv_area_t* area, lv_col
 #elif defined(DOC_CAPTURE) && defined(DOC_VIRT_W)
   // A virtual size the panel does not have: only the capture buffer below.
 #elif defined(TDP4_EXP_DBLFB) && defined(HAS_TDISPLAY_P4) && !defined(HAS_TDP4_LCD)
-  display.writePixelsRGB565Ex(area->x1, area->y1, w, h, reinterpret_cast<uint16_t*>(color_p),
-                              lv_disp_flush_is_last(disp_drv));
+  // true: the PPA is still scaling this band (TDP4_EXP_PPA_ASYNC); its done ISR signals flush-ready.
+  flush_async = display.writePixelsRGB565Ex(area->x1, area->y1, w, h, reinterpret_cast<uint16_t*>(color_p),
+                                            lv_disp_flush_is_last(disp_drv));
 #else
   display.writePixelsRGB565(area->x1, area->y1, w, h, reinterpret_cast<uint16_t*>(color_p));
 #endif
@@ -6520,7 +6523,7 @@ static void lvglFlushImpl(lv_disp_drv_t* disp_drv, const lv_area_t* area, lv_col
   if (g_web_mirror.active())
     webMirrorOnFlush(area->x1, area->y1, w, h, reinterpret_cast<const uint16_t*>(color_p));
 #endif
-  lv_disp_flush_ready(disp_drv);
+  if (!flush_async) lv_disp_flush_ready(disp_drv);
 }
 
 // Rotate the ST7789 panel in hardware for the landscape orientations. Uses the
@@ -81290,7 +81293,20 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
       }
 #endif  // HAS_TANMATSU
     }
+#if defined(TDP4_EXP_PPA_ASYNC) && defined(HAS_TDISPLAY_P4) && !defined(HAS_TDP4_LCD)
+    {   // Second band buffer: LVGL renders the next band while the PPA scales this one (P4 experiment)
+      static lv_color_t* s_draw_buffer2 = nullptr;
+      if (!s_draw_buffer2 && g_draw_buffer)
+        s_draw_buffer2 = (lv_color_t*)heap_caps_malloc(sizeof(lv_color_t) * g_draw_buf_px, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+      lv_disp_draw_buf_init(&g_lv.draw_buf, g_draw_buffer, s_draw_buffer2, g_draw_buf_px);
+      if (s_draw_buffer2) {
+        RM69A10Display::setFlushDoneCallback([](void* d) { lv_disp_flush_ready(static_cast<lv_disp_drv_t*>(d)); }, &g_lv.disp_drv);
+      }
+      printf("[P4] LVGL band buffers: %s\n", s_draw_buffer2 ? "2 (PPA async)" : "1 (no PSRAM for a second)");
+    }
+#else
     lv_disp_draw_buf_init(&g_lv.draw_buf, g_draw_buffer, nullptr, g_draw_buf_px);
+#endif
     g_cap_touch_hw_started = false;
     g_lv.touch_inited      = false;
 
@@ -81526,6 +81542,15 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
     g_lv.disp_drv.ver_res  = s_remote_mode ? (s_remote_landscape ? 240 : 400) : (ui_landscape ? 240 : 320);
 #endif
     g_lv.disp_drv.flush_cb = lvglFlush;
+#if defined(TDP4_EXP_PPA_ASYNC) && defined(HAS_TDISPLAY_P4) && !defined(HAS_TDP4_LCD)
+    // Two band buffers (PPA async): LVGL spins in draw_buf_flush while the previous band is in flight.
+    // Yield there, and never hang: a transfer that does not complete is released after 100 ms (logged).
+    if (g_lv.draw_buf.buf2)
+      g_lv.disp_drv.wait_cb = [](lv_disp_drv_t* d) {
+        if (RM69A10Display::asyncFlushStuck(100)) lv_disp_flush_ready(d);
+        else taskYIELD();
+      };
+#endif
     g_lv.disp_drv.draw_buf = &g_lv.draw_buf;
     // sw_rotate stays enabled ONLY for the transient keyboard-landscape trick
     // when the base orientation is portrait. In hardware landscape the LVGL

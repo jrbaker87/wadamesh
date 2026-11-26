@@ -23,7 +23,11 @@ public:
   void writePixelsRGB565(int x, int y, int w, int h, const uint16_t* pixels);
   // Same, for LVGL's flush: lastOfFrame = lv_disp_flush_is_last(). Only the double-buffer experiment
   // (TDP4_EXP_DBLFB) uses it: the frame is presented to the panel on the last band.
-  void writePixelsRGB565Ex(int x, int y, int w, int h, const uint16_t* pixels, bool lastOfFrame);
+  // Returns true when the band is still being transferred (TDP4_EXP_PPA_ASYNC): the caller must NOT
+  // signal flush-ready; the callback set with setFlushDoneCallback() does it when the PPA is done.
+  bool writePixelsRGB565Ex(int x, int y, int w, int h, const uint16_t* pixels, bool lastOfFrame);
+  static void setFlushDoneCallback(void (*cb)(void*), void* arg);
+  static bool asyncFlushStuck(uint32_t timeout_ms);   // PPA-async: a transfer overdue (then released)
   void setDisplayRotation(int rot) { (void)rot; }   // TODO(device): panel rotation / SW-rotate
   void startFrame() {}
   // Explicit forward (no default arg) so startFrame() stays unambiguous next to the no-arg one.

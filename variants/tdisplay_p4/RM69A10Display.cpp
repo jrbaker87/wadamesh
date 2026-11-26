@@ -116,18 +116,53 @@ constexpr int     kFbW = 568, kFbH = 1232;
 #include "driver/ppa.h"
 static ppa_client_handle_t s_ppa = nullptr;
 static bool s_ppa_failed = false;
+#if defined(TDP4_EXP_PPA_ASYNC)
+// Async (WADA_P4_EXP_PPA_ASYNC=1): a non-last band's transfer runs while LVGL renders the next band
+// into its second draw buffer; the done ISR signals LVGL flush-ready. LVGL calls the next flush
+// only after that, so one transfer is in flight at most and no CPU write to the framebuffers
+// (rows share cache lines) can overlap it. The last band of a frame stays blocking (present).
+static void (*s_flush_done_cb)(void*) = nullptr;
+static void* s_flush_done_arg = nullptr;
+static volatile bool s_ppa_async_busy = false;
+static volatile int64_t s_ppa_async_t0 = 0;     // when the in-flight transfer was started (us)
+static int s_ppa_last_geo[4] = {0, 0, 0, 0};     // nx, ny, w, h of the last async transfer (diagnostics)
+// Every transfer's completion lands here, blocking ones too, and the driver wakes a blocking caller
+// BEFORE it calls this: the caller can already have started the next frame's first async band. So a
+// completion counts only if it carries the tag of the transfer LVGL is waiting for (user_data).
+static uint32_t s_ppa_async_seq = 0;            // tag of the in-flight async transfer
+static bool IRAM_ATTR dbPpaDone(ppa_client_handle_t, ppa_event_data_t*, void* user_data) {
+  if (s_ppa_async_busy && (uint32_t)(uintptr_t)user_data == s_ppa_async_seq) {
+    s_ppa_async_busy = false;
+    if (s_flush_done_cb) s_flush_done_cb(s_flush_done_arg);
+  }
+  return false;
+}
+#endif
 static inline void dbCpuRowsWriteBack(uint8_t* fb, int r0, int r1) {   // rows [r0, r1]
   if (r1 < r0) return;
   esp_cache_msync(fb + (size_t)r0 * kFbW * 2, (size_t)(r1 - r0 + 1) * kFbW * 2,
                   ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
 }
-static bool dbUpscalePpa(uint8_t* fb, int nx, int ny, const uint16_t* src, int w, int h) {
+static bool dbUpscalePpa(uint8_t* fb, int nx, int ny, const uint16_t* src, int w, int h, bool async, bool* started_async) {
+  *started_async = false;
   if (s_ppa_failed) return false;
+  // Areas the PPA must not get: an ODD width or height. A 33x57 band from the Constellation
+  // screensaver (a 66-byte source stride) started a transfer that never completed, twice, at the
+  // same size; LVGL then spun forever waiting for it. Full-width bands (284) are never odd. Small
+  // areas stay on the CPU too: it is faster there anyway.
+  if ((w & 1) || (h & 1) || w < 32 || h < 8) return false;
   if (!s_ppa) {
     ppa_client_config_t cc = {};
     cc.oper_type = PPA_OPERATION_SRM;
     if (ppa_register_client(&cc, &s_ppa) != ESP_OK) { s_ppa_failed = true; printf("[RM69A10] PPA: no SRM client, CPU upscale\n"); return false; }
+#if defined(TDP4_EXP_PPA_ASYNC)
+    ppa_event_callbacks_t cbs = {};
+    cbs.on_trans_done = dbPpaDone;
+    ppa_client_register_event_callbacks(s_ppa, &cbs);
+    printf("[RM69A10] PPA SRM upscale on (async)\n");
+#else
     printf("[RM69A10] PPA SRM upscale on\n");
+#endif
   }
   ppa_srm_oper_config_t op = {};
   op.in.buffer = src;  op.in.pic_w = (uint32_t)w; op.in.pic_h = (uint32_t)h;
@@ -137,8 +172,29 @@ static bool dbUpscalePpa(uint8_t* fb, int nx, int ny, const uint16_t* src, int w
   op.out.block_offset_x = (uint32_t)nx; op.out.block_offset_y = (uint32_t)ny; op.out.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
   op.rotation_angle = PPA_SRM_ROTATION_ANGLE_0;
   op.scale_x = 2.0f; op.scale_y = 2.0f;
+#if defined(TDP4_EXP_PPA_ASYNC)
+  if (async && s_flush_done_cb) {
+    op.mode = PPA_TRANS_MODE_NON_BLOCKING;
+    s_ppa_last_geo[0] = nx; s_ppa_last_geo[1] = ny; s_ppa_last_geo[2] = w; s_ppa_last_geo[3] = h;
+    s_ppa_async_t0 = esp_timer_get_time();
+    if (++s_ppa_async_seq == 0) s_ppa_async_seq = 1;   // 0 tags blocking transfers
+    op.user_data = (void*)(uintptr_t)s_ppa_async_seq;
+    s_ppa_async_busy = true;
+  } else {
+    op.mode = PPA_TRANS_MODE_BLOCKING;
+    op.user_data = nullptr;
+  }
+#else
+  (void)async;
   op.mode = PPA_TRANS_MODE_BLOCKING;
+#endif
   const esp_err_t e = ppa_do_scale_rotate_mirror(s_ppa, &op);
+#if defined(TDP4_EXP_PPA_ASYNC)
+  if (op.mode == PPA_TRANS_MODE_NON_BLOCKING) {
+    if (e == ESP_OK) *started_async = true;
+    else s_ppa_async_busy = false;
+  }
+#endif
   if (e != ESP_OK) {
     static bool logged = false;
     if (!logged) { logged = true; printf("[RM69A10] PPA SRM failed (%s), CPU upscale for that band\n", esp_err_to_name(e)); }
@@ -176,10 +232,10 @@ static inline void dbRowCopy(int r) {
 }
 
 // Write one LVGL band into the back buffer, S x S nearest-neighbour (S=1: plain copy).
-static void dbBlit(int x, int y, int w, int h, const uint16_t* src, int S) {
+static bool dbBlit(int x, int y, int w, int h, const uint16_t* src, int S, bool allow_async = false) {
   dbOpen();
   int nx = x * S, ny = y * S, nw = w * S, nh = h * S;
-  if (nx < 0 || nx + nw > kFbW || ny < 0) return;
+  if (nx < 0 || nx + nw > kFbW || ny < 0) return false;
   if (ny + nh > kFbH) nh = kFbH - ny;
   const bool fullw = (nx == 0 && nw >= kFbW);
   uint8_t* back = s_fb[1 - s_front];
@@ -205,7 +261,12 @@ static void dbBlit(int x, int y, int w, int h, const uint16_t* src, int S) {
   DB_T0(pf_u0);
 #if defined(TDP4_EXP_PPA)
   if (!fullw) dbCpuRowsWriteBack(back, ny, ny + nh - 1);   // catch-up copies must reach memory before the PPA invalidate
-  if (S == 2 && nh == h * 2 && dbUpscalePpa(back, nx, ny, src, w, h)) { DB_ADD(upscale, pf_u0); return; }
+  {
+    bool started_async = false;
+    if (S == 2 && nh == h * 2 && dbUpscalePpa(back, nx, ny, src, w, h, allow_async, &started_async)) {
+      DB_ADD(upscale, pf_u0); return started_async;
+    }
+  }
 #endif
   for (int sr = 0; sr < h && sr * S < nh; ++sr) {
     const uint16_t* s = src + (size_t)sr * w;
@@ -222,6 +283,7 @@ static void dbBlit(int x, int y, int w, int h, const uint16_t* src, int S) {
   dbCpuRowsWriteBack(back, ny, ny + nh - 1);   // a CPU-upscaled band, before any later PPA invalidate
 #endif
   DB_ADD(upscale, pf_u0);
+  return false;
 }
 
 // The frame is complete: bring untouched rows up to date, write the buffer back and request the swap.
@@ -286,10 +348,10 @@ static inline void dbRowCopy(int r) {
   memcpy(s_fb[s_back] + o, s_fb[s_latest] + o, (size_t)kFbW * 2);
 }
 
-static void dbBlit(int x, int y, int w, int h, const uint16_t* src, int S) {
+static bool dbBlit(int x, int y, int w, int h, const uint16_t* src, int S, bool allow_async = false) {
   dbOpen();
   int nx = x * S, ny = y * S, nw = w * S, nh = h * S;
-  if (nx < 0 || nx + nw > kFbW || ny < 0) return;
+  if (nx < 0 || nx + nw > kFbW || ny < 0) return false;
   if (ny + nh > kFbH) nh = kFbH - ny;
   const bool fullw = (nx == 0 && nw >= kFbW);
   uint8_t* back = s_fb[s_back];
@@ -316,7 +378,12 @@ static void dbBlit(int x, int y, int w, int h, const uint16_t* src, int S) {
   DB_T0(pf_u0);
 #if defined(TDP4_EXP_PPA)
   if (!fullw) dbCpuRowsWriteBack(back, ny, ny + nh - 1);   // catch-up copies must reach memory before the PPA invalidate
-  if (S == 2 && nh == h * 2 && dbUpscalePpa(back, nx, ny, src, w, h)) { DB_ADD(upscale, pf_u0); return; }
+  {
+    bool started_async = false;
+    if (S == 2 && nh == h * 2 && dbUpscalePpa(back, nx, ny, src, w, h, allow_async, &started_async)) {
+      DB_ADD(upscale, pf_u0); return started_async;
+    }
+  }
 #endif
   for (int sr = 0; sr < h && sr * S < nh; ++sr) {
     const uint16_t* s = src + (size_t)sr * w;
@@ -333,6 +400,7 @@ static void dbBlit(int x, int y, int w, int h, const uint16_t* src, int S) {
   dbCpuRowsWriteBack(back, ny, ny + nh - 1);   // a CPU-upscaled band, before any later PPA invalidate
 #endif
   DB_ADD(upscale, pf_u0);
+  return false;
 }
 
 static void dbPresent(esp_lcd_panel_handle_t panel) {
@@ -566,9 +634,35 @@ void RM69A10Display::writePixelsRGB565(int x, int y, int w, int h, const uint16_
   writePixelsRGB565Ex(x, y, w, h, pixels, true);   // splash etc.: every call is a whole frame
 }
 
-void RM69A10Display::writePixelsRGB565Ex(int x, int y, int w, int h, const uint16_t* pixels, bool lastOfFrame) {
+// LVGL's flush wait hook (disp_drv.wait_cb) on the PPA-async path: true when the in-flight transfer has
+// not completed for timeout_ms. The caller then releases LVGL itself; the transfer is logged once.
+bool RM69A10Display::asyncFlushStuck(uint32_t timeout_ms) {
+#if defined(TDP4_EXP_PPA_ASYNC)
+  if (!s_ppa_async_busy) return false;
+  if ((esp_timer_get_time() - s_ppa_async_t0) < (int64_t)timeout_ms * 1000) return false;
+  s_ppa_async_busy = false;
+  static uint32_t n = 0;
+  if (++n <= 5 || (n % 100) == 0)
+    printf("[RM69A10] PPA async transfer did not complete in %u ms (#%u, band x=%d y=%d w=%d h=%d) -- released\n",
+           (unsigned)timeout_ms, (unsigned)n, s_ppa_last_geo[0], s_ppa_last_geo[1], s_ppa_last_geo[2], s_ppa_last_geo[3]);
+  return true;
+#else
+  (void)timeout_ms;
+  return false;
+#endif
+}
+
+void RM69A10Display::setFlushDoneCallback(void (*cb)(void*), void* arg) {
+#if defined(TDP4_EXP_PPA_ASYNC)
+  s_flush_done_arg = arg; s_flush_done_cb = cb;
+#else
+  (void)cb; (void)arg;
+#endif
+}
+
+bool RM69A10Display::writePixelsRGB565Ex(int x, int y, int w, int h, const uint16_t* pixels, bool lastOfFrame) {
   (void)lastOfFrame;
-  if (!_panel || !pixels || w <= 0 || h <= 0) return;
+  if (!_panel || !pixels || w <= 0 || h <= 0) return false;
 #if defined(TDP4_EXP_DBLFB) && RM_UI_SCALE > 1
   {
 #if defined(TDP4_PERF_TRACE)
@@ -578,7 +672,7 @@ void RM69A10Display::writePixelsRGB565Ex(int x, int y, int w, int h, const uint1
 #if defined(TDP4_PERF_TRACE)
     const int64_t pf_t1 = p4perf::now();
 #endif
-    dbBlit(x, y, w, h, pixels, RM_UI_SCALE);
+    const bool async = dbBlit(x, y, w, h, pixels, RM_UI_SCALE, !lastOfFrame);
 #if defined(TDP4_PERF_TRACE)
     const int64_t pf_t2 = p4perf::now();
 #endif
@@ -588,7 +682,7 @@ void RM69A10Display::writePixelsRGB565Ex(int x, int y, int w, int h, const uint1
     // up = writing the band into the back buffer; dma-wait = waiting for the last swap + the swap request
     p4perf::onFlush(pf_t2 - pf_t1, (pf_t1 - pf_t0) + (pf_t3 - pf_t2), false, (uint32_t)(w * h * RM_UI_SCALE * RM_UI_SCALE));
 #endif
-    return;
+    return async;
   }
 #endif
 #if defined(TDP4_FLUSH_TRACE)
@@ -667,7 +761,7 @@ void RM69A10Display::writePixelsRGB565Ex(int x, int y, int w, int h, const uint1
 #else
     if (s_flush_sem) xSemaphoreTake(s_flush_sem, pdMS_TO_TICKS(100));   // wait for the FB copy before the next flush reuses s_up
 #endif
-    return;
+    return false;
   }
   // fall through to an unscaled draw if the scratch alloc failed (tiny UI, but visible)
 #endif
@@ -682,6 +776,7 @@ void RM69A10Display::writePixelsRGB565Ex(int x, int y, int w, int h, const uint1
 #else
   if (s_flush_sem) xSemaphoreTake(s_flush_sem, pdMS_TO_TICKS(100));   // wait for the FB copy before LVGL reuses this buffer
 #endif
+  return false;
 }
 
 void RM69A10Display::setBrightness(uint8_t b) {
