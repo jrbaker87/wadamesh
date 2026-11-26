@@ -11122,7 +11122,15 @@ static void hideKb() {
   const bool base_is_landscape =
       (s_ui_rotation == LV_DISP_ROT_90 || s_ui_rotation == LV_DISP_ROT_270);
   const bool was_landscape = kb_was_landscape && !base_is_landscape;
-  kbApplyRotation(s_ui_rotation);
+  // Only when there is a rotation to undo. hideKb runs on every tab change (and every modal
+  // close), and kbApplyRotation re-applies the display rotation even when it is unchanged:
+  // lv_disp_set_rotation resizes every screen, so that re-laid out the whole UI (~25 ms on the
+  // P4) and invalidated the screen on each switch, with no keyboard ever shown.
+  {
+    lv_disp_t* d = lv_disp_get_default();
+    const bool rot_off = d && lv_disp_get_rotation(d) != static_cast<lv_disp_rot_t>(s_ui_rotation);
+    if (was_landscape || rot_off) kbApplyRotation(s_ui_rotation);
+  }
   // Landscape forced the modal/chat scroll containers down to keep the field
   // visible above the rotated keyboard; reset them to the top so the user
   // doesn't land mid-scroll when the screen comes back to portrait.
@@ -14275,6 +14283,55 @@ static void updateTabIndicator() {
 
 #if defined(TDP4_PERF_TRACE)
 extern "C" void tdisplay_p4_power_trace();   // target.cpp: battery temp/voltage/current line
+// Perf build: time LVGL's software draw hooks by kind, per frame (printed under each slow frame
+// by p4perf::onRefr). Installed once after the display driver registers; a background hook
+// installed later (auroraBoot) chains to these, so its own work is then counted outside them.
+namespace pfdraw {
+static void (*o_rect)(lv_draw_ctx_t*, const lv_draw_rect_dsc_t*, const lv_area_t*) = nullptr;
+static void (*o_arc)(lv_draw_ctx_t*, const lv_draw_arc_dsc_t*, const lv_point_t*, uint16_t, uint16_t, uint16_t) = nullptr;
+static void (*o_img)(lv_draw_ctx_t*, const lv_draw_img_dsc_t*, const lv_area_t*, const uint8_t*, lv_img_cf_t) = nullptr;
+static void (*o_letter)(lv_draw_ctx_t*, const lv_draw_label_dsc_t*, const lv_point_t*, uint32_t) = nullptr;
+static void (*o_line)(lv_draw_ctx_t*, const lv_draw_line_dsc_t*, const lv_point_t*, const lv_point_t*) = nullptr;
+static void (*o_poly)(lv_draw_ctx_t*, const lv_draw_rect_dsc_t*, const lv_point_t*, uint16_t) = nullptr;
+static void (*o_lblend)(lv_draw_ctx_t*, lv_draw_layer_ctx_t*, const lv_draw_img_dsc_t*) = nullptr;
+static void rect(lv_draw_ctx_t* c, const lv_draw_rect_dsc_t* d, const lv_area_t* a) {
+  const int64_t t0 = p4perf::now();
+  o_rect(c, d, a);
+  const p4perf::DrawKind k = (d->shadow_width > 0 && d->shadow_opa > LV_OPA_MIN) ? p4perf::DK_RECT_SHADOW
+                           : (d->bg_grad.dir != LV_GRAD_DIR_NONE)                ? p4perf::DK_RECT_GRAD
+                           : (d->radius > 0)                                      ? p4perf::DK_RECT_ROUND
+                                                                                  : p4perf::DK_RECT_PLAIN;
+  p4perf::drawAdd(k, p4perf::now() - t0);
+}
+static void arc(lv_draw_ctx_t* c, const lv_draw_arc_dsc_t* d, const lv_point_t* p, uint16_t r, uint16_t s, uint16_t e) {
+  const int64_t t0 = p4perf::now(); o_arc(c, d, p, r, s, e); p4perf::drawAdd(p4perf::DK_ARC, p4perf::now() - t0);
+}
+static void img(lv_draw_ctx_t* c, const lv_draw_img_dsc_t* d, const lv_area_t* a, const uint8_t* m, lv_img_cf_t cf) {
+  const int64_t t0 = p4perf::now(); o_img(c, d, a, m, cf); p4perf::drawAdd(p4perf::DK_IMG, p4perf::now() - t0);
+}
+static void letter(lv_draw_ctx_t* c, const lv_draw_label_dsc_t* d, const lv_point_t* p, uint32_t l) {
+  const int64_t t0 = p4perf::now(); o_letter(c, d, p, l); p4perf::drawAdd(p4perf::DK_LETTER, p4perf::now() - t0);
+}
+static void line(lv_draw_ctx_t* c, const lv_draw_line_dsc_t* d, const lv_point_t* a, const lv_point_t* b) {
+  const int64_t t0 = p4perf::now(); o_line(c, d, a, b); p4perf::drawAdd(p4perf::DK_LINE, p4perf::now() - t0);
+}
+static void poly(lv_draw_ctx_t* c, const lv_draw_rect_dsc_t* d, const lv_point_t* p, uint16_t n) {
+  const int64_t t0 = p4perf::now(); o_poly(c, d, p, n); p4perf::drawAdd(p4perf::DK_POLY, p4perf::now() - t0);
+}
+static void lblend(lv_draw_ctx_t* c, lv_draw_layer_ctx_t* l, const lv_draw_img_dsc_t* d) {
+  const int64_t t0 = p4perf::now(); o_lblend(c, l, d); p4perf::drawAdd(p4perf::DK_LAYER, p4perf::now() - t0);
+}
+static void install(lv_draw_ctx_t* c) {
+  if (!c || o_rect) return;
+  if (c->draw_rect)        { o_rect   = c->draw_rect;        c->draw_rect        = rect; }
+  if (c->draw_arc)         { o_arc    = c->draw_arc;         c->draw_arc         = arc; }
+  if (c->draw_img_decoded) { o_img    = c->draw_img_decoded; c->draw_img_decoded = img; }
+  if (c->draw_letter)      { o_letter = c->draw_letter;      c->draw_letter      = letter; }
+  if (c->draw_line)        { o_line   = c->draw_line;        c->draw_line        = line; }
+  if (c->draw_polygon)     { o_poly   = c->draw_polygon;     c->draw_polygon     = poly; }
+  if (c->layer_blend)      { o_lblend = c->layer_blend;      c->layer_blend      = lblend; }
+}
+}  // namespace pfdraw
 // Perf build: time every lv_timer callback. A pass that is slow in "other timers/callbacks" now says
 // WHICH callback, as a code address; decode it with
 //   riscv32-esp-elf-addr2line -pfiaC -e build/tdisplay_p4/application.elf <addr>
@@ -81131,6 +81188,11 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
       // AMOLED (RM69A10) = 284-wide; TFT-LCD (HI8561) = 270-wide.
     #if defined(HAS_TDP4_LCD)
       g_draw_buf_px = 270 * LV_DRAW_BUF_LINES;
+    #elif defined(TDP4_BAND_LINES)
+      // Experiment (WADA_P4_EXP_BAND_LINES=<n>): taller draw band. LVGL walks the object tree and
+      // resolves styles again for every band; at 24 lines a full frame is 26 bands, and that
+      // per-band overhead measured 2-4x the actual drawing.
+      g_draw_buf_px = 284 * TDP4_BAND_LINES;
     #else
       g_draw_buf_px = 284 * LV_DRAW_BUF_LINES;
     #endif
@@ -81473,6 +81535,9 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
       g_lv.disp_drv.monitor_cb = [](lv_disp_drv_t*, uint32_t ms, uint32_t px) { p4perf::onRefr(ms, px); };
 #endif
   lv_disp_drv_register(&g_lv.disp_drv);
+#if defined(TDP4_PERF_TRACE)
+  pfdraw::install(g_lv.disp_drv.draw_ctx);   // per-frame draw time by kind
+#endif
 #if defined(HAS_TANMATSU)
     // Apply the 270° software rotation now that the driver is registered: logical surface
     // becomes 800x480 and lv_disp_get_hor/ver_res report landscape for every layout query.

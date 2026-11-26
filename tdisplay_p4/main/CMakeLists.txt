@@ -218,6 +218,7 @@ endif()
 #   WADA_P4_EXP_BAND_INTERNAL=1 LVGL draw band (13 KB) in internal RAM instead of PSRAM
 #   WADA_P4_EXP_KB_SLOW=1       keyboard-expansion probe every 60 s instead of 15 s once absent
 #   WADA_P4_EXP_TAB_NOANIM=1    tab buttons / drawer tiles switch tabs without the slide animation
+#   WADA_P4_EXP_BAND_LINES=<n>  LVGL draw band height in lines (default 24; 616 = one band per frame)
 if(DEFINED ENV{WADA_P4_EXP_MEMCPY})
   idf_build_set_property(COMPILE_OPTIONS "-DLV_MEMCPY_MEMSET_STD=1" APPEND)
   message(STATUS "wadamesh: EXPERIMENT LV_MEMCPY_MEMSET_STD=1")
@@ -237,6 +238,10 @@ endif()
 if(DEFINED ENV{WADA_P4_EXP_KB_SLOW})
   idf_build_set_property(COMPILE_OPTIONS "-DTDP4_EXP_KB_SLOW=1" APPEND)
   message(STATUS "wadamesh: EXPERIMENT slow keyboard probe")
+endif()
+if(DEFINED ENV{WADA_P4_EXP_BAND_LINES})
+  idf_build_set_property(COMPILE_OPTIONS "-DTDP4_BAND_LINES=$ENV{WADA_P4_EXP_BAND_LINES}" APPEND)
+  message(STATUS "wadamesh: EXPERIMENT draw band $ENV{WADA_P4_EXP_BAND_LINES} lines")
 endif()
 if(DEFINED ENV{WADA_P4_EXP_TAB_NOANIM})
   idf_build_set_property(COMPILE_OPTIONS "-DTDP4_EXP_TAB_NOANIM=1" APPEND)

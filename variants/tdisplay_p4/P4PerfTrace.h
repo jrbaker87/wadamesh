@@ -80,6 +80,15 @@ struct Frame {
 };
 inline Frame fr;
 
+// Per-frame time inside LVGL's draw hooks, by kind (UITask.cpp installs the wrappers).
+enum DrawKind { DK_RECT_SHADOW, DK_RECT_GRAD, DK_RECT_ROUND, DK_RECT_PLAIN, DK_LETTER, DK_IMG,
+                DK_LINE, DK_ARC, DK_POLY, DK_LAYER, DK_COUNT };
+inline const char* const kDrawKindName[DK_COUNT] = {"shadow", "grad", "round", "rect", "text", "img",
+                                                     "line", "arc", "poly", "layer"};
+struct DrawProf { int64_t us[DK_COUNT] = {}; uint32_t n[DK_COUNT] = {}; };
+inline DrawProf dp;
+inline void drawAdd(DrawKind k, int64_t us) { dp.us[k] += us; ++dp.n[k]; }
+
 // One band went to the panel. up_us = CPU upscale, dma_us = draw_bitmap + wait for the copy.
 inline void onFlush(int64_t up_us, int64_t dma_us, bool timedOut, uint32_t px) {
   g.up.add((uint64_t)up_us);
@@ -102,8 +111,14 @@ inline void onRefr(uint32_t ms, uint32_t /*px*/) {
            "upscale %.1f | writeback %.1f\n",
            (unsigned)ms, (unsigned)fr.bands, (double)ms - flush, fr.wait / 1000.0, fr.rowcopy / 1000.0,
            (unsigned)fr.rows, fr.upscale / 1000.0, fr.writeback / 1000.0);
+    char line[256]; int n = 0;
+    for (int k = 0; k < DK_COUNT && n < (int)sizeof line - 32; ++k)
+      if (dp.n[k]) n += snprintf(line + n, sizeof line - n, " %s %.1f/%u", kDrawKindName[k],
+                                 dp.us[k] / 1000.0, (unsigned)dp.n[k]);
+    printf("[P4PERF]     draw ms/calls:%s\n", n ? line : " (no hooks)");
   }
   fr = Frame{};
+  dp = DrawProf{};
 }
 
 // One lv_timer_handler() call finished. flushesBefore = g.flushesTotal sampled before the call.
