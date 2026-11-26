@@ -126,16 +126,42 @@ uint16_t TDisplayP4Board::getBattMilliVolts() {
 }
 
 #if defined(TDP4_PERF_TRACE)
-// Perf build: one line of battery/thermal state for the power and heat investigation. Reads the
-// BQ27220 gauge: Temperature() 0x06 (0.1 K), Voltage() 0x08, BatteryStatus() 0x0A (raw hex),
-// Current() 0x0C (signed mA, + = charging), RemainingCapacity() 0x10, FullChargeCapacity() 0x12.
-extern "C" void tdisplay_p4_power_trace() {
+#include <LittleFS.h>
+extern bool g_fs_ok;   // main.cpp: internal 'storage' LittleFS mounted
+// Perf build: one line of battery/thermal state for the power and heat investigation, every 10 s.
+// BQ27220 standard commands: Temperature() 0x06 (0.1 K; the pack thermistor OR the gauge's own
+// sensor, per its config), InternalTemperature() 0x28 (always the gauge die), Voltage() 0x08,
+// BatteryStatus() 0x0A, Current() 0x0C (signed mA, + = charging), AverageCurrent() 0x14,
+// RemainingCapacity() 0x10, FullChargeCapacity() 0x12.
+// The same line is appended to /p4power.log on internal LittleFS (capped at 96 KB), so a run on
+// battery (no USB, no serial) can be read back: the next boot prints the file and deletes it.
+static const char* kPowerLog = "/p4power.log";
+static void powerLogDumpOnce() {
+  static bool done = false;
+  if (done || !g_fs_ok) return;
+  done = true;
+  File f = LittleFS.open(kPowerLog, "r");
+  if (!f) return;
+  printf("[P4POWER-LOG] begin (%u bytes from the previous run)\n", (unsigned)f.size());
+  char line[160]; int n = 0;
+  while (f.available()) {
+    const int c = f.read();
+    if (c < 0) break;
+    if (c == '\n' || n >= (int)sizeof line - 1) { line[n] = 0; printf("[P4POWER-LOG] %s\n", line); n = 0; delay(1); continue; }
+    line[n++] = (char)c;
+  }
+  f.close();
+  printf("[P4POWER-LOG] end\n");
+  LittleFS.remove(kPowerLog);
+}
+extern "C" void tdisplay_p4_power_trace(int screen_on, int brightness_pct) {
+  powerLogDumpOnce();
   // Each register read independently (one retry) so a single lost transaction on the shared bus
   // does not blank the whole line; failed registers are named and print as 0.
-  static const uint8_t kReg[6] = {0x06, 0x08, 0x0A, 0x0C, 0x10, 0x12};
-  uint16_t v[6] = {0};
-  char bad[40] = "";
-  for (int i = 0; i < 6; ++i) {
+  static const uint8_t kReg[8] = {0x06, 0x28, 0x08, 0x0A, 0x0C, 0x14, 0x10, 0x12};
+  uint16_t v[8] = {0};
+  char bad[48] = "";
+  for (int i = 0; i < 8; ++i) {
     if (bq27220ReadU16(kReg[i], v[i])) continue;
     delay(2);
     if (!bq27220ReadU16(kReg[i], v[i])) {
@@ -143,10 +169,20 @@ extern "C" void tdisplay_p4_power_trace() {
       snprintf(bad + strlen(bad), sizeof(bad) - strlen(bad), " 0x%02x", kReg[i]);
     }
   }
-  const uint16_t tk = v[0], mv = v[1], st = v[2], ci = v[3], rem = v[4], full = v[5];
+  const uint16_t tk = v[0], tki = v[1], mv = v[2], st = v[3], ci = v[4], ai = v[5], rem = v[6], full = v[7];
   if (bad[0]) printf("[P4PERF] power: gauge read failed for reg%s\n", bad);
-  printf("[P4PERF] power: batt %.1f C  %u mV  %d mA  status 0x%04x  %u/%u mAh\n",
-         (double)tk / 10.0 - 273.15, mv, (int)(int16_t)ci, st, rem, full);
+  char line[160];
+  snprintf(line, sizeof line, "t=%lus batt %.1f C (gauge die %.1f C) %u mV %d mA (avg %d) status 0x%04x %u/%u mAh screen=%d bright=%d%%",
+           (unsigned long)(millis() / 1000), (double)tk / 10.0 - 273.15, (double)tki / 10.0 - 273.15, mv,
+           (int)(int16_t)ci, (int)(int16_t)ai, st, rem, full, screen_on, brightness_pct);
+  printf("[P4PERF] power: %s\n", line);
+  if (g_fs_ok) {
+    File f = LittleFS.open(kPowerLog, "a");
+    if (f) {
+      if (f.size() < 96 * 1024) { f.print(line); f.print('\n'); }
+      f.close();
+    }
+  }
 }
 #endif
 

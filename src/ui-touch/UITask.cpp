@@ -14285,7 +14285,7 @@ static void updateTabIndicator() {
 }
 
 #if defined(TDP4_PERF_TRACE)
-extern "C" void tdisplay_p4_power_trace();   // target.cpp: battery temp/voltage/current line
+extern "C" void tdisplay_p4_power_trace(int screen_on, int brightness_pct);   // target.cpp: battery/thermal line + /p4power.log
 // Perf build: time LVGL's software draw hooks by kind, per frame (printed under each slow frame
 // by p4perf::onRefr). Installed once after the display driver registers; a background hook
 // installed later (auroraBoot) chains to these, so its own work is then counted outside them.
@@ -87859,7 +87859,7 @@ void UITask::loop() {
     {   // battery / temperature / charge current every 10 s, to line up with the frame stats
       static uint32_t pf_pw_ms = 0;
       const uint32_t pf_now_ms = millis();
-      if (pf_now_ms - pf_pw_ms >= 10000) { pf_pw_ms = pf_now_ms; tdisplay_p4_power_trace(); }
+      if (pf_now_ms - pf_pw_ms >= 10000) { pf_pw_ms = pf_now_ms; tdisplay_p4_power_trace(_screen_off ? 0 : 1, (int)s_brightness_pct); }
     }
     const uint32_t pf_fl0 = p4perf::g.flushesTotal;
     const int64_t  pf_t0  = p4perf::now();
