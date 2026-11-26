@@ -37705,12 +37705,21 @@ static int       s_tile_dec_want = 0;                  // tiles wanted (grid siz
 // frame, which fragmented the 2 MB-PSRAM V4 down to <128 KB blocks so fresh tiles
 // couldn't allocate (only the top rows rendered). Reusing the buffer in place = zero
 // churn = no fragmentation. Full teardown (freeMapTileSlot) still frees the buffer.
+// Did the last renderMapTiles() pass have every visible tile decoded and on screen, and for which
+// view? onMapTabActivated skips its "Loading map..." hint + forced full-frame refresh (~60 ms on
+// the P4) when coming back to an unchanged, fully resident view. Any slot release/free clears it.
+static bool        s_map_resident_ok   = false;
+static double      s_map_resident_lat  = 0.0, s_map_resident_lon = 0.0;
+static uint8_t     s_map_resident_zoom = 0;
+static const char* s_map_resident_root = nullptr;
 static void releaseMapTileSlot(MapTile& t) {
+  s_map_resident_ok = false;
   if (t.img) { lv_obj_del(t.img); t.img = nullptr; }
   lv_img_cache_invalidate_src(&t.dsc);   // this slot's dsc content is now stale
   t.in_use = false;                       // t.rgb565 intentionally kept for reuse
 }
 static void freeMapTileSlot(MapTile& t) {
+  s_map_resident_ok = false;
   if (t.img)    { lv_obj_del(t.img); t.img = nullptr; }
   // CRITICAL: invalidate LVGL's image cache entry for this dsc before
   // freeing the underlying buffer. The cache is keyed by lv_img_dsc_t* and
@@ -41143,6 +41152,11 @@ static void renderMapTiles() {
   // (any_loaded true) — that's the common "panned toward the edge of my
   // saved area" case where a big centered overlay would be too intrusive.
   s_map_last_missing = n_missing;
+  s_map_resident_ok   = (n_missing == 0 && n_wanted > 0);
+  s_map_resident_lat  = s_map_center_lat;
+  s_map_resident_lon  = s_map_center_lon;
+  s_map_resident_zoom = s_map_zoom;
+  s_map_resident_root = mapTileRoot();
 
   bool wifi_up = false;
 #if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
@@ -44157,11 +44171,18 @@ static void onMapTabActivated() {
   // could not paint until the probe had already finished, so the whole scan
   // happened with the OUTGOING tab still frozen on the panel and the device
   // looking wedged. Nothing here depends on the centre or zoom.
-  if (s_map_status_lbl) {
-    lv_label_set_text(s_map_status_lbl, TR("Loading map\xe2\x80\xa6"));
-    lv_obj_clear_flag(s_map_status_lbl, LV_OBJ_FLAG_HIDDEN);
-  }
-  { P4PERF_SCOPE("map: lv_refr_now (Loading hint)"); lv_refr_now(NULL); }   // drain one frame so the label reaches the panel before we block
+  // Skipped when the view we are returning to is unchanged and was fully decoded: renderMapTiles
+  // below is then a pure re-position (no reads, no decodes), so there is nothing to wait for.
+  const bool map_resident = s_map_resident_ok && !s_route_active &&
+      s_map_resident_lat == s_map_center_lat && s_map_resident_lon == s_map_center_lon &&
+      s_map_resident_zoom == s_map_zoom && s_map_resident_root == mapTileRoot();
+  if (!map_resident) {
+    if (s_map_status_lbl) {
+      lv_label_set_text(s_map_status_lbl, TR("Loading map\xe2\x80\xa6"));
+      lv_obj_clear_flag(s_map_status_lbl, LV_OBJ_FLAG_HIDDEN);
+    }
+    { P4PERF_SCOPE("map: lv_refr_now (Loading hint)"); lv_refr_now(NULL); }
+  }   // drain one frame so the label reaches the panel before we block
   // The entire UI is now clocked at 160 MHz from UITask::begin, so there's
   // no per-tab boost dance here anymore. (Tried 240 MHz briefly — the
   // PSRAM bus tightens enough at that clock for the SJPG decoder to
