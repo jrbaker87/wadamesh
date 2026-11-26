@@ -9729,6 +9729,7 @@ static void chatSaveStamp(char* out, size_t cap, uint32_t epoch) {
 }
 static bool uiDataFsIsSdCard();                  // fwd (storage code below) — About page shows the resolved backend
 static File uiDataOpen(const char* name, const char* mode);   // fwd — About page reads the msgs file size
+static fs::FS* uiDataFsInternalPtr();             // fwd — the resolved ui-data FS when it is internal flash, else nullptr
 
 // ---- Segmented store: runtime segment table (loop-task-owned) --------------
 // Oldest-first view of the on-disk segment set. Rebuilt by the boot loader,
@@ -26759,6 +26760,12 @@ static fs::FS& battLogFs() {
     // Backend resolved to SD but real I/O failed — wedge/removal tell.
     sdNoteIoFailure();
   }
+#endif
+#if defined(HAS_TANMATSU) || defined(HAS_TDISPLAY_P4) || defined(HAS_CROWPANEL_P4_101)
+  // These boards have no SPIFFS partition: nothing ever mounts it, so every battery-log open
+  // failed with "File system is not mounted". Use the internal data FS chat history resolved
+  // to (P4 LittleFS 'storage', Tanmatsu FFat).
+  if (fs::FS* f = uiDataFsInternalPtr()) return *f;
 #endif
   return SPIFFS;
 }
@@ -78119,6 +78126,9 @@ static bool uiDataFsIsSdCard() {
 #else
   return false;
 #endif
+}
+static fs::FS* uiDataFsInternalPtr() {
+  return (uiDataFsReady() && !uiDataFsIsSdCard()) ? s_ui_data_fs : nullptr;
 }
 static File uiDataOpen(const char* name, const char* mode) {
 #if defined(TDP4_POKE_TRACE)
