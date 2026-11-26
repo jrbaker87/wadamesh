@@ -130,10 +130,21 @@ uint16_t TDisplayP4Board::getBattMilliVolts() {
 // BQ27220 gauge: Temperature() 0x06 (0.1 K), Voltage() 0x08, BatteryStatus() 0x0A (raw hex),
 // Current() 0x0C (signed mA, + = charging), RemainingCapacity() 0x10, FullChargeCapacity() 0x12.
 extern "C" void tdisplay_p4_power_trace() {
-  uint16_t tk = 0, mv = 0, st = 0, ci = 0, rem = 0, full = 0;
-  const bool ok = bq27220ReadU16(0x06, tk) && bq27220ReadU16(0x08, mv) && bq27220ReadU16(0x0A, st) &&
-                  bq27220ReadU16(0x0C, ci) && bq27220ReadU16(0x10, rem) && bq27220ReadU16(0x12, full);
-  if (!ok) { printf("[P4PERF] power: gauge read failed\n"); return; }
+  // Each register read independently (one retry) so a single lost transaction on the shared bus
+  // does not blank the whole line; failed registers are named and print as 0.
+  static const uint8_t kReg[6] = {0x06, 0x08, 0x0A, 0x0C, 0x10, 0x12};
+  uint16_t v[6] = {0};
+  char bad[40] = "";
+  for (int i = 0; i < 6; ++i) {
+    if (bq27220ReadU16(kReg[i], v[i])) continue;
+    delay(2);
+    if (!bq27220ReadU16(kReg[i], v[i])) {
+      v[i] = 0;
+      snprintf(bad + strlen(bad), sizeof(bad) - strlen(bad), " 0x%02x", kReg[i]);
+    }
+  }
+  const uint16_t tk = v[0], mv = v[1], st = v[2], ci = v[3], rem = v[4], full = v[5];
+  if (bad[0]) printf("[P4PERF] power: gauge read failed for reg%s\n", bad);
   printf("[P4PERF] power: batt %.1f C  %u mV  %d mA  status 0x%04x  %u/%u mAh\n",
          (double)tk / 10.0 - 273.15, mv, (int)(int16_t)ci, st, rem, full);
 }

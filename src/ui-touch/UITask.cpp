@@ -14249,9 +14249,15 @@ static void updateTabIndicator() {
   // n equal buttons separated by pad_column gaps: button i's centre is at
   // content_x1 + i*(w+gap) + w/2, with w+gap = (content_w + gap) / n.
   lv_obj_t* bar = lv_tabview_get_tab_btns(g_lv.tabview);
-  lv_obj_update_layout(bar);
   lv_area_t a;
   lv_obj_get_coords(bar, &a);
+  // lv_obj_update_layout() lays out the WHOLE screen (the new page included), ~25 ms on the P4 on
+  // every tab change. The bar's geometry does not change on a tab switch, so only force a layout
+  // when the bar has never been laid out yet (the boot-time call).
+  if (lv_area_get_width(&a) <= 1) {
+    lv_obj_update_layout(bar);
+    lv_obj_get_coords(bar, &a);
+  }
   const lv_coord_t pl  = lv_obj_get_style_pad_left(bar, LV_PART_MAIN);
   const lv_coord_t pr  = lv_obj_get_style_pad_right(bar, LV_PART_MAIN);
   const lv_coord_t gap = lv_obj_get_style_pad_column(bar, LV_PART_MAIN);
@@ -14305,6 +14311,27 @@ void pfWrapTimers() {
 
 static void tabChangedCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  // One tap can deliver VALUE_CHANGED twice (the bubbled btnmatrix event plus a second one for the
+  // same tab), and each pass costs ~25+ ms of rebuild. Drop a repeat for the tab we just handled
+  // within 250 ms; the first pass already did all of the work.
+  static uint32_t s_tcb_last_ms = 0;
+  {
+    const int t_now = getActiveTab();
+#if defined(TDP4_PERF_TRACE)
+    lv_obj_t* src = lv_event_get_target(e);
+    printf("[P4PERF]   tabChangedCb src=%s tab=%d prev=%d\n",
+           src == g_lv.tabview ? "tabview" : (src == lv_tabview_get_tab_btns(g_lv.tabview) ? "btnmatrix" : "other"),
+           t_now, s_lv_tab_prev);
+#endif
+    if (t_now == s_lv_tab_prev && s_tcb_last_ms != 0 && lv_tick_elaps(s_tcb_last_ms) < 250) {
+#if defined(TDP4_PERF_TRACE)
+      printf("[P4PERF]   tabChangedCb duplicate dropped\n");
+#endif
+      return;
+    }
+  }
+  s_tcb_last_ms = lv_tick_get();
+  if (s_tcb_last_ms == 0) s_tcb_last_ms = 1;
   P4PERF_SCOPE("tabChangedCb (whole)");
 #if defined(TLORA_PAGER)
   navTabMemLeaving();   // first: closeSettingsModal below empties the focus group
@@ -14362,7 +14389,7 @@ static void tabChangedCb(lv_event_t* e) {
     // Returned to Home in drawer mode (or drawer-as-home pref) -> restore it (NO toggle
     // here). The mode follows, or the next Home press "opened" the open drawer and
     // only the second one reached the widgets.
-    if (s_home_drawer_mode || s_home_is_drawer) { s_home_drawer_mode = true; openAppDrawer(); }
+    if (s_home_drawer_mode || s_home_is_drawer) { s_home_drawer_mode = true; P4PERF_SCOPE("openAppDrawer"); openAppDrawer(); }
   } else if (new_t != HOME_TAB_INDEX && prev_t == HOME_TAB_INDEX) {
   { P4PERF_SCOPE("closeAppDrawerSync"); closeAppDrawerSync(); }  // leaving Home -> hide (mode kept); sync so the map can't paint under it
     if (s_hw_arrange) hwArrangeDone();           // ...and Arrange is done (saved)
@@ -14383,8 +14410,8 @@ static void tabChangedCb(lv_event_t* e) {
   { P4PERF_SCOPE("onMapTabActivated"); onMapTabActivated(); }
   } else {
     if (prev_t == MAP_TAB_INDEX) applyMapChrome(false);   // restore opaque chrome
-    clearRouteReplay();    // drop any route-replay overlay when leaving the map
-    mapPickExit();         // and the position-pick crosshair + bar, unsaved
+    { P4PERF_SCOPE("clearRouteReplay"); clearRouteReplay(); }    // drop any route-replay overlay when leaving the map
+    { P4PERF_SCOPE("mapPickExit"); mapPickExit(); }         // and the position-pick crosshair + bar, unsaved
     // Leaving the map used to drop all nine decoded tiles, so every re-open
     // paid the full read + JPEG decode again — measured at ~2.5 s of blocked
     // UI on the M9 ([STALL] ui:lvgl), on EVERY visit, not just the first.
