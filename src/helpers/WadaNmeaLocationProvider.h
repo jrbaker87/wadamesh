@@ -41,6 +41,9 @@ class WadaNmeaLocationProvider : public LocationProvider {
   // Optional board hook run at the end of the power-up sequence in begin(), after the enable and reset pins are set
   // (e.g. a wake pulse some GPS modules need). Null on boards that don't set one.
   void (*_post_enable)() = nullptr;
+  // Optional board hook that powers the receiver up and down where there is no enable GPIO
+  // (the T-Display P4 drives its L76K's WAKE line through an I/O expander). Null elsewhere.
+  void (*_power_hook)(bool on) = nullptr;
   int _pin_reset;
   int _pin_en;
   unsigned long next_check = 0;
@@ -189,6 +192,7 @@ public:
   }
 
   void setPostEnableHook(void (*hook)()) { _post_enable = hook; }
+  void setPowerHook(void (*hook)(bool on)) { _power_hook = hook; }
 
   void claim() {
     _claims++;
@@ -216,6 +220,7 @@ public:
     if (_pin_en == -1) while (_gps_serial->available()) _gps_serial->read();
     if (_pin_en != -1) digitalWrite(_pin_en, _en_active);
     if (_pin_reset != -1) digitalWrite(_pin_reset, !GPS_RESET_ACTIVE);
+    if (_power_hook) _power_hook(true);
 #if defined(HAS_THINKNODE_M9)
     if (_probe_serial && _probe_rx >= 0 && _probe_tx >= 0) {
       // Re-attach UART1 RX/TX pins after stop() tri-stated them to prevent ESD back-powering.
@@ -288,6 +293,7 @@ public:
 #if !defined(HAS_THINKNODE_M9)
     ubxGnss(false);
 #endif
+    if (_power_hook) _power_hook(false);
     release();
   }
 

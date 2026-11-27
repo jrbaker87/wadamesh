@@ -83080,9 +83080,17 @@ static void pagerWifiPsUpdate(int screen_on) {
 
 static void setCpuForScreen(bool screen_on) {
 #if defined(CONFIG_IDF_TARGET_ESP32P4)
-  // The P4's Arduino HAL only accepts 360 MHz (240/80 log a "could not be set" error every screen
-  // toggle) — no DFS downclock available through this API on that chip, so skip entirely.
-  (void)screen_on;
+  // The P4 runs its CPU from the 360 MHz CPLL through a divider: 360, 180 and 90 are the valid
+  // steps (240/80, the S3 values, fail with "could not be set"). 360 and 180 keep the memory bus
+  // at 180 MHz and APB at 90 MHz, so only the cores slow down; every peripheral clock, the DSI
+  // panel, PSRAM and the SDIO link to the C6 are unchanged. 90 would also halve the memory bus,
+  // which feeds the panel's framebuffer stream, and measured no steady saving over 180. The
+  // screensaver (lit, animating) keeps 360: wakeScreen() and the saver start never call this with
+  // false.
+  static int s_cur_mhz = 360;
+  const int want = screen_on ? 360 : 180;
+  if (want == s_cur_mhz) return;
+  if (setCpuFrequencyMhz(want)) s_cur_mhz = want;
 #else
   static int s_cur_mhz = 240;
   const int want = screen_on ? 240 : 80;

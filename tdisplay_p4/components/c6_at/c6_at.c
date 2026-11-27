@@ -24,6 +24,7 @@ static const char *TAG = "c6_at";
 // immediately before SDIO initialization; the early board power sequence is
 // too far ahead of this worker to provide the same startup contract.
 extern bool tdisplay_p4_reset_c6(void);
+extern void tdisplay_p4_c6_power_off(void);   // target.cpp: hold the C6 in reset (EN low)
 
 // ---- C6 SDIO wiring (T-Display P4, "SDIO_2" — slot 1) ----
 #define C6_SDIO_SLOT   1
@@ -933,10 +934,22 @@ static void worker_do_scan(void) {
     ESP_LOGI(TAG, "scan: %d APs", count);
 }
 
+// ESP-AT string parameters: a comma, a double quote or a backslash must be escaped with a backslash,
+// or the parameter is cut short there (a password containing one could never join).
+static void at_escape(char *out, size_t sz, const char *in) {
+    size_t n = 0;
+    for (; in && *in && n + 2 < sz; ++in) {
+        if (*in == ',' || *in == '"' || *in == '\\') out[n++] = '\\';
+        out[n++] = *in;
+    }
+    out[n] = 0;
+}
+
 static void worker_do_join(const char *ssid, const char *pass) {
-    char cmd[192];
-    // NB: no escaping of " , \ in credentials yet (rare in practice; TODO if it bites).
-    snprintf(cmd, sizeof(cmd), "AT+CWJAP=\"%s\",\"%s\"", ssid, pass ? pass : "");
+    char cmd[224], e_ssid[68], e_pass[132];
+    at_escape(e_ssid, sizeof e_ssid, ssid);
+    at_escape(e_pass, sizeof e_pass, pass ? pass : "");
+    snprintf(cmd, sizeof(cmd), "AT+CWJAP=\"%s\",\"%s\"", e_ssid, e_pass);
     static char resp[512];
     bool ok = c6at_command(cmd, resp, sizeof(resp), 20000);
     if (ok || strstr(resp, "WIFI GOT IP")) {
@@ -945,7 +958,17 @@ static void worker_do_join(const char *ssid, const char *pass) {
         ESP_LOGI(TAG, "join '%s': %s ip=%08lx", ssid, s_connected ? "CONNECTED" : "assoc,no-ip", (unsigned long)s_ip4);
     } else {
         s_connected = false; s_ip4 = 0;
-        ESP_LOGW(TAG, "join '%s' FAILED", ssid);
+        // ESP-AT's reason: +CWJAP:1 timeout, 2 wrong password, 3 network not found, 4 failed.
+        const char *why = "no reason given";
+        const char *c = strstr(resp, "+CWJAP:");
+        if (c) switch (c[7]) {
+            case '1': why = "timeout"; break;
+            case '2': why = "wrong password"; break;
+            case '3': why = "network not found"; break;
+            case '4': why = "connect failed"; break;
+            default:  why = "unknown code"; break;
+        }
+        ESP_LOGW(TAG, "join '%s' FAILED (%s)", ssid, why);
     }
 }
 
@@ -966,6 +989,21 @@ static bool link_bringup(int attempts) {
     return false;
 }
 
+// Reset the C6 and bring the link up, the way the boot path's second attempt succeeds: SDIO down,
+// reset, then a further second before the host enumerates the card. Probed only 1 s after the reset
+// (what the power-up and the runtime recovery used to do), the C6's SDIO registers stay unreadable
+// and later probes without another reset never recover (seen on every Wi-Fi off -> on, and on the
+// first runtime recovery attempt). Each failed try starts again from a fresh reset.
+static bool link_reset_bringup(int tries) {
+    for (int i = 0; i < tries; i++) {
+        sdio_bring_down();
+        if (!tdisplay_p4_reset_c6()) ESP_LOGE(TAG, "C6 reset hook failed");
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        if (c6at_begin()) { ESP_LOGI(TAG, "worker: AT link up after reset, try %d", i + 1); return true; }
+    }
+    return false;
+}
+
 // Fail one request without touching the bus (link down).
 static void req_fail_fast(const c6_req_t *req) {
     if (req->type == REQ_SCAN) { s_scan_n = 0; s_scan_state = 0; }
@@ -976,6 +1014,7 @@ static void req_fail_fast(const c6_req_t *req) {
 
 // A stall was decided: take the link down NOW (every caller fails fast from here on), forget all
 // state that lived on the C6, and leave the reset to worker_link_recover() once the backoff allows.
+static void worker_forget_link(void);
 static void worker_link_stalled(void) {
     const uint32_t now = now_ms();
     s_health_armed = false;
@@ -987,6 +1026,11 @@ static void worker_link_stalled(void) {
     else
         printf("[C6AT] link stalled: resetting the C6 in %lu s (backoff)\n",
                (unsigned long)((s_health.next_reset_ms - now) / 1000));
+    worker_forget_link();
+}
+
+// Everything that lived on the C6 is gone (a reset, or the C6 powered off): drop it here too.
+static void worker_forget_link(void) {
     // Association, IP, listener and SNTP config all lived on the C6 and die with the reset. The
     // listener WANT flag (s_srv_want/s_srv_port) is kept: the idle loop re-arms CIPSERVER once the
     // link is back, and the router's C6Server stays begun, so nothing app-side has to restart it.
@@ -1007,6 +1051,44 @@ static void worker_link_stalled(void) {
     while (s_reqq && xQueueReceive(s_reqq, &req, 0) == pdTRUE) req_fail_fast(&req);
 }
 
+// ---- power gate --------------------------------------------------------------------------------
+// With Wi-Fi switched off this firmware has no use for the C6 (no Bluetooth on the AT backend), yet
+// powered and idle it drew ~37 mA, a sixth of the board's screen-off draw. The main loop asks for it
+// off (c6at_set_power); the worker parks it: link down, state forgotten, SDIO slot released, C6 held
+// in reset. Asked back on, it goes through the same reset + bring-up as a runtime recovery.
+static volatile bool s_power_want = true;
+static bool          s_parked     = false;
+
+static void worker_park(void) {
+    printf("[C6AT] Wi-Fi off: powering the C6 down\n");
+    s_health_armed = false;
+    s_health_act   = C6H_ACT_NONE;
+    s_up           = false;
+    s_recovering   = false;
+    worker_forget_link();
+    sdio_bring_down();
+    tdisplay_p4_c6_power_off();
+    s_parked = true;
+}
+
+static void worker_unpark(void) {
+    printf("[C6AT] Wi-Fi on: powering the C6 up\n");
+    s_parked = false;
+    if (link_reset_bringup(3)) {
+        s_dead         = false;
+        s_health_armed = true;
+        s_health_act   = C6H_ACT_NONE;
+        printf("[C6AT] link up after power-up\n");
+    } else {
+        sdio_bring_down();
+        s_recovering = true;           // the normal recovery backoff keeps trying
+        printf("[C6AT] C6 silent after power-up: retrying with the recovery backoff\n");
+    }
+}
+
+void c6at_set_power(bool on) { s_power_want = on; }
+bool c6at_is_parked(void)    { return s_parked; }
+
 // Reset the C6 through the boot path and, on success, rejoin the last network. Worker-only: the
 // worker owns all SDIO access, so nothing else can touch slot 1 while it is torn down.
 static void worker_link_recover(void) {
@@ -1014,9 +1096,7 @@ static void worker_link_recover(void) {
     const unsigned attempt = (unsigned)s_health.resets + 1;
     c6h_on_reset(&s_health, now);      // arms the backoff for the NEXT attempt, success or not
     printf("[C6AT] reset attempt %u: SDIO down, C6 reset, AT bring-up\n", attempt);
-    sdio_bring_down();
-    if (!tdisplay_p4_reset_c6()) ESP_LOGE(TAG, "recover: C6 reset hook failed");
-    if (!link_bringup(3)) {
+    if (!link_reset_bringup(3)) {
         sdio_bring_down();             // leave the slot clean for the next attempt
         printf("[C6AT] reset attempt %u failed: C6 still silent, next try in %lu s\n", attempt,
                (unsigned long)((s_health.next_reset_ms - now_ms()) / 1000));
@@ -1099,8 +1179,11 @@ static void c6WorkerTask(void *arg) {
     }
     uint32_t last_refresh = 0;
     for (;;) {
+        // Power gate first: a parked C6 is neither recovered nor health-checked.
+        if (!s_power_want && !s_parked)      worker_park();
+        else if (s_power_want && s_parked)   worker_unpark();
         // Runtime recovery: the link stalled earlier; reset once the backoff window allows.
-        if (s_recovering && c6h_reset_due(&s_health, now_ms())) worker_link_recover();
+        if (!s_parked && s_recovering && c6h_reset_due(&s_health, now_ms())) worker_link_recover();
         worker_assoc_service();
         worker_health_service();
         c6_req_t req;

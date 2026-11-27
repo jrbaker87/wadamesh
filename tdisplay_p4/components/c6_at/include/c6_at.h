@@ -32,6 +32,10 @@ bool c6at_is_dead(void);      // worker gave up bringing the link up (AT probe e
 // "AT" ping), took it down and is resetting the C6 (with 30 s .. 5 min backoff between resets).
 // c6at_is_up() is false meanwhile; the UI shows "reconnecting" and the worker rejoins by itself.
 bool c6at_is_recovering(void);
+// Power gate: off parks the C6 (link down, held in reset) until it is asked back on, which runs the
+// recovery bring-up. For Wi-Fi switched off; c6at_is_up() is false while parked.
+void c6at_set_power(bool on);
+bool c6at_is_parked(void);
 
 // ---- async requests (enqueue only; the worker executes) -----------------------------------------
 void c6at_req_scan(void);

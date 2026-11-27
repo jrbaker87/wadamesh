@@ -31,6 +31,7 @@
 #include "../../src/ui-touch/i18n.h"          // TR() for the missing-store boot alert (#708)
 #include "../../src/helpers/esp32/BootTimeSync.h"   // opt-in cold-boot clock sync over saved Wi-Fi (#383)
 #include "../../src/helpers/WifiRejoinPolicy.h"     // when the loop rejoins a dropped/failed Wi-Fi link (#685)
+#include "../../src/ui-touch/TouchSleep.h"         // battery saver: idle loop throttle (loopEnd at the end of the loop)
 // Defined in this tree's src/helpers/esp32/WifiRuntimeStore.cpp. The <helpers/esp32/WifiRuntimeStore.h>
 // above resolves to the core's vendored copy, which predates it, so declare it here.
 bool wifiScanIsActive();
@@ -610,6 +611,23 @@ extern "C" void app_main(void) {
     const bool c6_up = c6at_is_up() || c6at_is_recovering();
   #endif
     bool wifi_radio_en = c6_up && wifiConfigWantsWifi();
+  #if !TDP4_C6_HOSTED
+    // Wi-Fi switched off: power the C6 down (~37 mA measured, idle with nothing to do on this
+    // backend). After 10 s off, so a quick off/on does not cycle it, and only once the boot latch
+    // below has applied the user's choice to it (or the C6 never answered). Switched back on, it
+    // is powered up at once and the join below starts when the link is back.
+    {
+      static uint32_t s_c6_off_since = 0;
+      if (wifiConfigWantsWifi()) {
+        s_c6_off_since = 0;
+        c6at_set_power(true);
+      } else {
+        if (!s_c6_off_since) s_c6_off_since = millis() | 1;
+        if (millis() - s_c6_off_since >= 10000 && (wifi_radio_inited || c6at_is_dead() || millis() > 60000))
+          c6at_set_power(false);
+      }
+    }
+  #endif
     // The C6 runs its own AT firmware with auto-connect enabled, so after a power
     // cycle it rejoins the last AP by itself, before this loop ever asks it to.
     // So latch only once the AT link is actually up, and APPLY the user's choice
@@ -732,6 +750,11 @@ extern "C" void app_main(void) {
     p4perf::onLoop(pf_loop1 - pf_loop0, p4perf::now() - pf_loop1);   // UI vs everything else in this loop
     p4perf::tick();                                                   // one [P4PERF] line per second
 #endif
+    // Battery saver (Settings > Battery): parked (screen off, on battery, no client, mesh idle)
+    // it blocks this loop up to 50 ms so the cores sit idle instead of waking 1000 times a second.
+    // It was never called on this board, so the switch only rested the GPS and stilled the
+    // background here. Off (the default) it returns at once.
+    touchSleep::loopEnd(millis());
     vTaskDelay(1);
   }
 }

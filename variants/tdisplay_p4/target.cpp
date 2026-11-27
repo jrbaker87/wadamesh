@@ -54,6 +54,16 @@ ClockFloorRTC rtc_clock(fallback_clock);
   EnvironmentSensorManager sensors;
 #endif
 
+#if ENV_INCLUDE_GPS
+// GPS off (and the GPS saver's rests) on this board: the L76K has no enable GPIO, and it ignores the
+// u-blox stop the provider sends, so "off" used to leave it tracking (~38 mA measured on battery).
+// Its WAKE line on the XL9535 does stop it.
+// Installed at static init, right after nmea is constructed in this file (this board's main never
+// calls board.begin()); the hook itself only runs once sensors.begin() starts the GPS.
+static void p4GpsPower(bool on) { xl9535.write(Xl9535::IO_GPS_WAKE, on); }
+static struct P4GpsPowerHook { P4GpsPowerHook() { nmea.setPowerHook(p4GpsPower); } } s_p4_gps_power_hook;
+#endif
+
 void TDisplayP4Board::begin() {
   ESP32Board::begin();
 }
@@ -178,6 +188,12 @@ bool radio_init() {
 mesh::LocalIdentity radio_new_identity() {
   RadioNoiseListener rng(radio);
   return mesh::LocalIdentity(&rng);   // fresh random identity from radio RSSI noise
+}
+
+// The C6's power gate (c6_at: Wi-Fi switched off). EN low holds it in reset, its lowest draw short of
+// cutting a rail; tdisplay_p4_reset_c6() below releases it again.
+extern "C" void tdisplay_p4_c6_power_off() {
+  if (xl9535.ok()) xl9535.write(Xl9535::IO_C6_EN, false);
 }
 
 extern "C" bool tdisplay_p4_reset_c6() {
