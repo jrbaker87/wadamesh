@@ -39,6 +39,7 @@ bool c6at_is_parked(void);
 
 // ---- async requests (enqueue only; the worker executes) -----------------------------------------
 void c6at_req_scan(void);
+uint32_t c6at_ms_since_scan_req(void);   // ms since the last scan request (UINT32_MAX: none yet)
 // Join/disconnect share ONE latest-wins slot (not the request queue): a join replaces whatever is
 // pending, a disconnect cancels a pending join. A join posted while the link is recovering waits
 // for the link to come back.

@@ -612,16 +612,36 @@ extern "C" void app_main(void) {
   #endif
     bool wifi_radio_en = c6_up && wifiConfigWantsWifi();
   #if !TDP4_C6_HOSTED
+    static uint32_t s_wifi_user_apply_ms = 0;   // last connect/apply from Settings (0: none)
     // Wi-Fi switched off: power the C6 down (~37 mA measured, idle with nothing to do on this
     // backend). After 10 s off, so a quick off/on does not cycle it, and only once the boot latch
     // below has applied the user's choice to it (or the C6 never answered). Switched back on, it
     // is powered up at once and the join below starts when the link is back.
     {
       static uint32_t s_c6_off_since = 0;
+      static uint32_t s_unjoined_since = 0;   // Wi-Fi on, not connected, since (0: connected / off)
       if (wifiConfigWantsWifi()) {
         s_c6_off_since = 0;
         c6at_set_power(true);
+        // No network for 2 min: switch Wi-Fi off (saved, as from Settings), and the branch below
+        // powers the C6 down. Wi-Fi is meant to be switched on when it is wanted, and a C6 left
+        // searching for a network that is not there draws for nothing. Not while someone is
+        // setting it up: a scan or a connect in the last 90 s restarts the 2 minutes.
+        const bool user_busy = c6at_ms_since_scan_req() < 90000 ||
+                               (s_wifi_user_apply_ms && millis() - s_wifi_user_apply_ms < 90000);
+        if (!wifi_radio_inited || c6at_connected() || user_busy) {
+          s_unjoined_since = 0;
+        } else {
+          if (!s_unjoined_since) s_unjoined_since = millis() | 1;
+          if (millis() - s_unjoined_since >= 120000) {
+            s_unjoined_since = 0;
+            printf("[WIFI] no network for 2 min: Wi-Fi switched off\n");
+            wifiConfigSetRadioEnabled(false);
+            ui_task.showAlert(TR("No Wi-Fi network: Wi-Fi switched off to save the battery. Turn it on in Settings > Wi-Fi when you need it."), 6000);
+          }
+        }
       } else {
+        s_unjoined_since = 0;
         if (!s_c6_off_since) s_c6_off_since = millis() | 1;
         if (millis() - s_c6_off_since >= 10000 && (wifi_radio_inited || c6at_is_dead() || millis() > 60000))
           c6at_set_power(false);
@@ -648,6 +668,9 @@ extern "C" void app_main(void) {
       wifi_started = false;
     }
     if (wifiConfigConsumeApplyRequest()) {
+  #if !TDP4_C6_HOSTED
+      s_wifi_user_apply_ms = millis() | 1;   // a connect from Settings: not "no network" yet
+  #endif
       if (wifi_started) {
         if (!wifi_radio_en) { WiFi.disconnect(true); delay(50); WiFi.mode(WIFI_OFF); }
         else                { WiFi.disconnect(false, false); delay(50); }

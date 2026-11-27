@@ -1280,7 +1280,13 @@ void c6at_worker_start(void) {
     xTaskCreatePinnedToCore(c6WorkerTask, "c6at", 16384, NULL, 3, &s_worker, 1);
 }
 
+static volatile uint32_t s_scan_req_ms = 0;   // last scan asked for (0: never)
+uint32_t c6at_ms_since_scan_req(void) {
+    return s_scan_req_ms ? now_ms() - s_scan_req_ms : UINT32_MAX;
+}
+
 void c6at_req_scan(void) {
+    s_scan_req_ms = now_ms() | 1;
     if (s_dead) { s_scan_n = 0; s_scan_state = 0; return; }
     s_scan_state = -1;                       // running (set now so a poll right after sees RUNNING)
     c6_req_t r = { .type = REQ_SCAN };
